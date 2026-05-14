@@ -203,3 +203,53 @@ def collect_eval_results(state, test_ids, nprobe=32, silent=True):
     }
 
     return image_results, summary_row
+
+
+
+def show_3panel(state, test_photo, meta, confidence, true_id):
+    """
+    Generates a visual verification plot comparing the simulated query 
+    to the vault's best match.
+    """
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    from io import BytesIO
+
+    # 1. Resolve True Identity Image
+    true_row = state.source_df[state.source_df['id'] == str(true_id)].iloc[0]
+    true_url = str(true_row['url']).lower()
+    prefix = "met" if "metmuseum.org" in true_url else "moma" # Add "aic" if needed
+    
+    true_blob = state.bucket.blob(f"images/{prefix}_{true_id}.jpg")
+    true_img = Image.open(BytesIO(true_blob.download_as_bytes()))
+
+    # 2. Resolve Predicted Image (if any)
+    pred_img = None
+    if meta:
+        pred_row = state.source_df[state.source_df['id'] == str(meta['id'])].iloc[0]
+        pred_url = str(pred_row['url']).lower()
+        p_prefix = "met" if "metmuseum.org" in pred_url else "moma"
+        pred_blob = state.bucket.blob(f"images/{p_prefix}_{meta['id']}.jpg")
+        pred_img = Image.open(BytesIO(pred_blob.download_as_bytes()))
+
+    # 3. Plotting
+    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    
+    ax[0].imshow(test_photo)
+    ax[0].set_title(f"Query (Simulated)\nTrue ID: {true_id}")
+    ax[0].axis('off')
+
+    ax[1].imshow(true_img)
+    ax[1].set_title(f"Vault Reference\n{true_row['title'][:30]}...")
+    ax[1].axis('off')
+
+    if pred_img:
+        ax[2].imshow(pred_img)
+        match_status = "✅ MATCH" if str(meta['id']) == str(true_id) else "❌ MISMATCH"
+        ax[2].set_title(f"{match_status}\nConf: {confidence:.2f}")
+    else:
+        ax[2].set_title("No Match Found")
+    ax[2].axis('off')
+
+    plt.tight_layout()
+    plt.show()
