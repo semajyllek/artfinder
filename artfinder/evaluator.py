@@ -89,108 +89,105 @@ def apply_simulation(img_rgb):
     canvas[y_off:y_off+h, x_off:x_off+w] = warped
     return canvas
 
-
 def run_final_exam_and_log(state, nprobe=32, silent=True, test_ids=None):
-    """
-    Runs evaluation. If test_ids is provided, it performs a targeted 
-    verification of those specific items.
-    """
     if test_ids is None:
-        # Fallback to the standard manifest on GCS
         blob = state.bucket.blob(Config.MANIFEST_PATH)
         test_ids = json.loads(blob.download_as_string())["test_queries"]
     
     image_results, summary_row = collect_eval_results(state, test_ids, nprobe=nprobe, silent=silent)
-    
     print(f"\n--- VALIDATION SCORE: {summary_row['accuracy']*100:.1f}% | Latency: {summary_row['avg_latency_ms']}ms ---")
     return image_results, summary_row
 
 
+
 def collect_eval_results(state, test_ids, nprobe=32, silent=True):
     """
-    Runs retrieval evaluation on a specific list of IDs.
-    Automatically synchronizes metadata and resolves image source paths.
+    Main orchestrator for batch verification. 
+    Breaks the batch into discrete tasks: fetch, simulate, identify, and score.
     """
-    import time
-    from io import BytesIO
-    from PIL import Image
-    from tqdm.auto import tqdm
-    from .ingestor import load_source_metadata  # Ensure metadata helper is accessible
-
-    # 1. AUTO-REFRESH: Sync local state with GCS to include newly vaulted items
+    from .ingestor import load_source_metadata
     state.source_df = load_source_metadata(state.bucket)
     
-    image_results = []
-    correct = 0
+    results = []
     run_id = time.strftime("%Y%m%d_%H%M%S")
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 2. ITERATION LOOP
     for obj_id in tqdm(test_ids, desc="Verifying Batch"):
-        # Safe lookup: ensures the ID exists in the refreshed metadata
-        mask = state.source_df['id'] == str(obj_id)
-        if not mask.any():
-            print(f"⚠️ Warning: ID {obj_id} not found in metadata. Skipping.")
+        # 1. Fetch and Prepare
+        raw_img = self._fetch_ground_truth_image(state, obj_id)
+        if raw_img is None:
             continue
-            
-        row = state.source_df[mask].iloc[0]
+
+        # 2. Simulate Gallery Conditions
+        test_photo = apply_simulation(raw_img)
         
-        # 3. DYNAMIC PREFIXING: Resolve folder path based on URL patterns
-        url_str = str(row['url']).lower()
-        if "metmuseum.org" in url_str:
-            source_prefix = "met"
-        elif "artic.edu" in url_str:
-            source_prefix = "aic"
-        else:
-            source_prefix = "moma"
-            
-        # 4. IMAGE RETRIEVAL & SIMULATION
-        try:
-            blob_img = state.bucket.blob(f"images/{source_prefix}_{obj_id}.jpg")
-            raw_img = np.array(Image.open(BytesIO(blob_img.download_as_bytes())).convert("RGB"))
-            
-            # Apply the handheld gallery simulation (affine transform, background, etc.)
-            test_photo = apply_simulation(raw_img)
-            
-            t0 = time.perf_counter()
-            # Perform retrieval using the optimized ORB/FAISS pipeline
-            meta, conf = identify_art(state, test_photo, nprobe=nprobe)
-            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+        # 3. Identify and Measure Latency
+        prediction, confidence, latency = self._run_inference(state, test_photo, nprobe)
 
-            is_match = (str(meta["id"]) == str(obj_id)) if meta else False
-            if is_match:
-                correct += 1
-
-            # 5. LOGGING
-            image_results.append({
-                "run_id": run_id,
-                "timestamp": ts,
-                "n_features": Config.N_FEATURES,
-                "nprobe": nprobe,
-                "true_id": obj_id,
-                "predicted_id": meta["id"] if meta else None,
-                "predicted_title": meta["title"] if meta else None,
-                "predicted_artist": meta["artist"] if meta else None,
-                "confidence": round(conf, 4) if meta else 0.0,
-                "match": is_match,
-                "latency_ms": latency_ms,
-            })
-            
-            # Optional visual proof for failures or if not silent
-            if not silent or not is_match:
-                from .evaluator import show_3panel
-                show_3panel(state, test_photo, meta, conf, obj_id)
+        # 4. Score the result
+        result_entry = self._score_prediction(
+            obj_id, prediction, confidence, latency, run_id, ts
+        )
+        results.append(result_entry)
+        
+        # 5. Visual Feedback (Optional)
+        if not silent or not result_entry['match']:
+            show_3panel(state, test_photo, prediction, confidence, str(obj_id))
                 
-        except Exception as e:
-            print(f"❌ Error processing ID {obj_id}: {e}")
-            continue
+    return results, self._summarize_run(results, state, nprobe, run_id, ts)
 
-    # 6. SUMMARY CALCULATION
-    n_tested = len(image_results)
-    accuracy = correct / n_tested if n_tested > 0 else 0
-    avg_latency = round(sum(r["latency_ms"] for r in image_results) / n_tested, 2) if n_tested > 0 else 0
+def _fetch_ground_truth_image(self, state, obj_id):
+    """Handles the GUID logic to retrieve the correct image from GCS."""
+    obj_id_str = str(obj_id)
     
-    summary_row = {
+    # Path Logic: Support both 'met_123' and legacy '123' (moma_123)
+    filename = f"{obj_id_str}.jpg" if "_" in obj_id_str else f"moma_{obj_id_str}.jpg"
+    blob_path = f"images/{filename}"
+    
+    try:
+        blob = state.bucket.blob(blob_path)
+        return np.array(Image.open(BytesIO(blob.download_as_bytes())).convert("RGB"))
+    except Exception:
+        print(f"❌ Missing Image: {blob_path}")
+        return None
+
+def _run_inference(self, state, test_photo, nprobe):
+    """Executes the search and times the response."""
+    t0 = time.perf_counter()
+    meta, conf = identify_art(state, test_photo, nprobe=nprobe)
+    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    return meta, conf, latency_ms
+
+def _score_prediction(self, true_id, meta, confidence, latency, run_id, ts):
+    """Compares true ID vs predicted ID and formats the record."""
+    true_id_str = str(true_id)
+    pred_id = str(meta["id"]) if meta else None
+    is_match = (pred_id == true_id_str)
+
+    return {
+        "run_id": run_id,
+        "timestamp": ts,
+        "n_features": Config.N_FEATURES,
+        "nprobe": None, # Will be set in summary
+        "true_id": true_id_str,
+        "predicted_id": pred_id,
+        "predicted_title": meta["title"] if meta else None,
+        "predicted_artist": meta["artist"] if meta else None,
+        "confidence": round(confidence, 4),
+        "match": is_match,
+        "latency_ms": latency,
+    }
+
+def _summarize_run(self, results, state, nprobe, run_id, ts):
+    """Aggregates all results into a single performance row."""
+    n_tested = len(results)
+    if n_tested == 0:
+        return {}
+
+    correct = sum(1 for r in results if r['match'])
+    avg_latency = round(sum(r["latency_ms"] for r in results) / n_tested, 2)
+    
+    return {
         "run_id": run_id,
         "timestamp": ts,
         "n_features": Config.N_FEATURES,
@@ -198,27 +195,13 @@ def collect_eval_results(state, test_ids, nprobe=32, silent=True):
         "nprobe": nprobe,
         "n_tested": n_tested,
         "n_correct": correct,
-        "accuracy": round(accuracy, 4),
+        "accuracy": round(correct / n_tested, 4),
         "avg_latency_ms": avg_latency,
     }
 
-    return image_results, summary_row
-
-
-
 
 def show_3panel(state, test_photo, meta, confidence, true_id):
-    """
-    Displays a 3-panel comparison: Input Photo, Predicted Match, and Ground Truth.
-    Updated to handle GUIDs (met_ / moma_) and prevent path collisions.
-    """
-    import matplotlib.pyplot as plt
-    from PIL import Image
-    from io import BytesIO
-
-    # 1. Resolve Ground Truth Path
-    # If the ID is a GUID (has an underscore), use it directly. 
-    # Otherwise, assume it's a legacy MoMA integer.
+    """Displays a 3-panel comparison with resolved path logic."""
     true_id_str = str(true_id)
     true_filename = f"{true_id_str}.jpg" if "_" in true_id_str else f"moma_{true_id_str}.jpg"
     true_blob_path = f"images/{true_filename}"
@@ -226,32 +209,25 @@ def show_3panel(state, test_photo, meta, confidence, true_id):
     true_blob = state.bucket.blob(true_blob_path)
     try:
         true_img = Image.open(BytesIO(true_blob.download_as_bytes()))
-    except Exception as e:
-        print(f"❌ Error: Ground Truth image not found at {true_blob_path}")
+    except:
         return
 
-    # 2. Resolve Predicted Match Path
     pred_img = None
     if meta:
         pred_id_str = str(meta['id'])
         pred_filename = f"{pred_id_str}.jpg" if "_" in pred_id_str else f"moma_{pred_id_str}.jpg"
         pred_blob_path = f"images/{pred_filename}"
-        
         try:
             pred_blob = state.bucket.blob(pred_blob_path)
             pred_img = Image.open(BytesIO(pred_blob.download_as_bytes()))
-        except Exception as e:
-            print(f"⚠️ Warning: Predicted image not found at {pred_blob_path}")
+        except:
+            pass
 
-    # 3. Plotting Logic
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Panel A: The Test Photo
     axes[0].imshow(test_photo)
     axes[0].set_title("Input (Test Photo)")
     axes[0].axis('off')
     
-    # Panel B: The Model's Prediction
     if pred_img:
         axes[1].imshow(pred_img)
         title = f"Prediction: {meta.get('title', 'Unknown')}\nArtist: {meta.get('artist', 'Unknown')}\nConf: {confidence:.4f}"
@@ -261,7 +237,6 @@ def show_3panel(state, test_photo, meta, confidence, true_id):
         axes[1].set_title("Prediction (Metadata only)")
     axes[1].axis('off')
     
-    # Panel C: Ground Truth (The original image in the vault)
     axes[2].imshow(true_img)
     axes[2].set_title(f"Ground Truth\nID: {true_id_str}")
     axes[2].axis('off')
