@@ -105,16 +105,101 @@ def run_final_exam_and_log(state, nprobe=32, silent=True, test_ids=None):
     print(f"\n--- VALIDATION SCORE: {summary_row['accuracy']*100:.1f}% | Latency: {summary_row['avg_latency_ms']}ms ---")
     return image_results, summary_row
 
-def collect_eval_results(state, test_ids, nprobe=32, silent=True):
-    """Logic updated to accept a direct list of IDs."""
-    image_results, correct = [], 0
-    run_id, ts = time.strftime("%Y%m%d_%H%M%S"), time.strftime("%Y-%m-%d %H:%M:%S")
 
+def collect_eval_results(state, test_ids, nprobe=32, silent=True):
+    """
+    Runs retrieval evaluation on a specific list of IDs.
+    Automatically synchronizes metadata and resolves image source paths.
+    """
+    import time
+    from io import BytesIO
+    from PIL import Image
+    from tqdm.auto import tqdm
+    from .ingestor import load_source_metadata  # Ensure metadata helper is accessible
+
+    # 1. AUTO-REFRESH: Sync local state with GCS to include newly vaulted items
+    state.source_df = load_source_metadata(state.bucket)
+    
+    image_results = []
+    correct = 0
+    run_id = time.strftime("%Y%m%d_%H%M%S")
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # 2. ITERATION LOOP
     for obj_id in tqdm(test_ids, desc="Verifying Batch"):
-        # Dynamic prefixing: Find the source label in metadata to locate the image
-        # This handles 'met_' vs 'moma_' automatically
-        row = state.source_df[state.source_df['id'] == str(obj_id)].iloc[0]
-        source_prefix = "met" if "metmuseum.org" in row['url'] else "moma"
+        # Safe lookup: ensures the ID exists in the refreshed metadata
+        mask = state.source_df['id'] == str(obj_id)
+        if not mask.any():
+            print(f"⚠️ Warning: ID {obj_id} not found in metadata. Skipping.")
+            continue
+            
+        row = state.source_df[mask].iloc[0]
         
-        blob_img = state.bucket.blob(f"images/{source_prefix}_{obj_id}.jpg")
-        # ... rest of the simulation and identification logic ...
+        # 3. DYNAMIC PREFIXING: Resolve folder path based on URL patterns
+        url_str = str(row['url']).lower()
+        if "metmuseum.org" in url_str:
+            source_prefix = "met"
+        elif "artic.edu" in url_str:
+            source_prefix = "aic"
+        else:
+            source_prefix = "moma"
+            
+        # 4. IMAGE RETRIEVAL & SIMULATION
+        try:
+            blob_img = state.bucket.blob(f"images/{source_prefix}_{obj_id}.jpg")
+            raw_img = np.array(Image.open(BytesIO(blob_img.download_as_bytes())).convert("RGB"))
+            
+            # Apply the handheld gallery simulation (affine transform, background, etc.)
+            test_photo = apply_simulation(raw_img)
+            
+            t0 = time.perf_counter()
+            # Perform retrieval using the optimized ORB/FAISS pipeline
+            meta, conf = identify_art(state, test_photo, nprobe=nprobe)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+
+            is_match = (str(meta["id"]) == str(obj_id)) if meta else False
+            if is_match:
+                correct += 1
+
+            # 5. LOGGING
+            image_results.append({
+                "run_id": run_id,
+                "timestamp": ts,
+                "n_features": Config.N_FEATURES,
+                "nprobe": nprobe,
+                "true_id": obj_id,
+                "predicted_id": meta["id"] if meta else None,
+                "predicted_title": meta["title"] if meta else None,
+                "predicted_artist": meta["artist"] if meta else None,
+                "confidence": round(conf, 4) if meta else 0.0,
+                "match": is_match,
+                "latency_ms": latency_ms,
+            })
+            
+            # Optional visual proof for failures or if not silent
+            if not silent or not is_match:
+                from .evaluator import show_3panel
+                show_3panel(state, test_photo, meta, conf, obj_id)
+                
+        except Exception as e:
+            print(f"❌ Error processing ID {obj_id}: {e}")
+            continue
+
+    # 6. SUMMARY CALCULATION
+    n_tested = len(image_results)
+    accuracy = correct / n_tested if n_tested > 0 else 0
+    avg_latency = round(sum(r["latency_ms"] for r in image_results) / n_tested, 2) if n_tested > 0 else 0
+    
+    summary_row = {
+        "run_id": run_id,
+        "timestamp": ts,
+        "n_features": Config.N_FEATURES,
+        "vault_size": len(state.source_df),
+        "nprobe": nprobe,
+        "n_tested": n_tested,
+        "n_correct": correct,
+        "accuracy": round(accuracy, 4),
+        "avg_latency_ms": avg_latency,
+    }
+
+    return image_results, summary_row
