@@ -78,18 +78,38 @@ def build_authority_set():
         lines = [line.decode('utf-8') for line in response.readlines()]
     return {row['artist'].lower().strip() for row in csv.DictReader(lines)}
 
-def is_curated_artist(artist_name, authority_set):
-    name = str(artist_name).lower().strip()
-    if not name or name == 'unknown': return False
-    if name in authority_set: return True
-    for auth_name in authority_set:
-        if auth_name in name or name in auth_name: return True
-        len_diff = abs(len(name) - len(auth_name))
-        if len_diff > (1.0 - Config.FUZZY_THRESHOLD/100.0) * max(len(name), len(auth_name)):
-            continue
-        if fuzz.ratio(name, auth_name) > Config.FUZZY_THRESHOLD:
+
+def is_curated_artist(name, authority_set):
+    """
+    Determines if an artist exists in the curated set using 
+    cleaning and fuzzy matching.
+    """
+    if not name or str(name).lower() in ['unknown', 'unidentified artist', '']:
+        return False
+    
+    # 1. CLEANING: Lowercase and strip parenthetical "noise" (dates, locations)
+    # This turns "Rembrandt (Rembrandt van Rijn)" -> "rembrandt"
+    clean_name = str(name).lower()
+    clean_name = re.sub(r'\(.*\)', '', clean_name).strip()
+    
+    # 2. EXACT MATCH: Fast check against the authority set
+    if clean_name in authority_set:
+        return True
+        
+    # 3. FUZZY MATCH: Token-based comparison to handle name order
+    # token_set_ratio handles "Sargent, John" vs "John Sargent" perfectly
+    # We use a threshold of 90 to maintain precision.
+    for curated_name in authority_set:
+        # Avoid checking very short strings to prevent false positives
+        if len(clean_name) < 4: continue 
+        
+        ratio = fuzz.token_set_ratio(clean_name, curated_name)
+        if ratio >= 90:
             return True
+            
     return False
+
+
 
 def initialize_engine():
     client, bucket = setup_gcs()
