@@ -89,38 +89,58 @@ def resolve_image_url(row):
                 return url
     return None
 
+
 def onboard_artwork(row, master_index, state):
-    """Processes an image, extracts ORB features, and uploads to GCS."""
+    """
+    Processes an image, extracts ORB features, and uploads to GCS.
+    Updated to handle GUIDs (met_123) without double-prefixing.
+    """
     obj_id = str(row['ObjectID'])
     img_url = resolve_image_url(row)
     source_label = row.get('Source', 'moma')
 
-    if not img_url: return None
+    if not img_url: 
+        return None
 
     try:
+        # 1. Fetch Image
         req = urllib.request.Request(img_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=Config.TIMEOUT) as resp:
             content = resp.read()
 
+        # 2. Process for ORB
         img = Image.open(BytesIO(content)).convert('L')
         img.thumbnail(Config.RESIZE_DIM)
-
         kp, des = state.orb.detectAndCompute(np.array(img), None)
 
         if des is not None:
             start_row = master_index.ntotal
             master_index.add(des)
 
-            blob = state.bucket.blob(f"images/{source_label}_{obj_id}.jpg")
+            # 3. FIXED PATH LOGIC: Prevent double-prefixing
+            # If obj_id already has an underscore (met_123), use it directly.
+            # If not, it's a legacy ID (123), so append source_label (moma_123).
+            filename = f"{obj_id}.jpg" if "_" in obj_id else f"{source_label}_{obj_id}.jpg"
+            blob = state.bucket.blob(f"images/{filename}")
+            
             blob.upload_from_string(content, content_type='image/jpeg')
 
             return {
-                'id': obj_id, 'title': str(row['Title']), 'artist': str(row['Artist']),
-                'url': row.get('SourceURL', f"https://moma.org/works/{obj_id}"),
-                'start_row': start_row, 'end_row': master_index.ntotal - 1
+                'id': obj_id, 
+                'title': str(row['Title']), 
+                'artist': str(row['Artist']),
+                'url': row.get('SourceURL', img_url), # Fallback to img_url if SourceURL missing
+                'start_row': start_row, 
+                'end_row': master_index.ntotal - 1
             }
-    except: return None
+    except Exception as e: 
+        print(f"Error onboarding {obj_id}: {e}")
+        return None
     return None
+
+
+
+
 
 # ─── REPORTING HELPERS ───────────────────────────────────────────────────────
 
