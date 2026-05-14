@@ -28,33 +28,60 @@ class MetIngestor(BaseIngestor):
                     
         return pd.DataFrame(delta_rows)
 
+    
     def _process_department(self, dept_id, known_ids, limit, delta_rows, headers):
         """
-        Walks a single department. Adds matches directly to the 
-        delta_rows list passed from the parent.
+        LAYER 1: THE SCANNER
+        Orchestrates the department walk and manages the progress bar.
         """
         obj_ids = self._get_department_ids(dept_id, headers)
+        pbar = tqdm(reversed(obj_ids), desc=f"Dept {dept_id}", total=len(obj_ids))
         
-        # We reverse to hit higher-fidelity records first
-        for oid in tqdm(reversed(obj_ids), desc=f"Dept {dept_id}", total=len(obj_ids)):
-            # Hard exit if we hit the limit mid-department
+        for oid in pbar:
+            # Hard stop if limit is reached
             if len(delta_rows) >= limit:
+                pbar.set_description(f"Dept {dept_id} [LIMIT REACHED]")
                 return
 
-            guid = f"met_{oid}"
-            if guid in known_ids:
-                continue
-                
-            metadata = self._get_object_metadata(oid, headers)
-            if metadata and self._is_valid_asset(metadata):
-                delta_rows.append({
-                    'ObjectID': guid,
-                    'Title':    metadata.get('title', 'Unknown'),
-                    'Artist':   metadata.get('artistDisplayName', 'Unknown'),
-                    'ImageURL': metadata.get('primaryImageSmall', ''),
-                    'Source':   'met'
-                })
+            # Update postfix so you can see the harvest count live
+            pbar.set_postfix({"harvested": f"{len(delta_rows)}/{limit}"})
+            
+            # Delegate the processing of a single ID
+            self._ingest_single_object(oid, known_ids, delta_rows, headers)
 
+    
+    def _ingest_single_object(self, oid, known_ids, delta_rows, headers):
+        """
+        LAYER 2: THE EXTRACTOR
+        Handles GUID creation, deduplication, and metadata fetching.
+        """
+        guid = f"met_{oid}"
+        
+        # Idempotency check: Skip if already in vault
+        if guid in known_ids:
+            return
+
+        metadata = self._get_object_metadata(oid, headers)
+        
+        # Validate and transform if valid
+        if metadata and self._is_valid_asset(metadata):
+            self._append_to_harvest(guid, metadata, delta_rows)
+
+    
+    def _append_to_harvest(self, guid, metadata, delta_rows):
+        """
+        LAYER 3: THE ACCUMULATOR
+        Finalizes the dictionary and adds it to the master delta list.
+        """
+        delta_rows.append({
+            'ObjectID': guid,
+            'Title':    metadata.get('title', 'Unknown'),
+            'Artist':   metadata.get('artistDisplayName', 'Unknown'),
+            'ImageURL': metadata.get('primaryImageSmall', ''),
+            'Source':   'met'
+        })
+
+    
     def _get_all_department_ids(self, headers):
         """Fetches all 19+ departments from the Met."""
         try:
@@ -64,6 +91,7 @@ class MetIngestor(BaseIngestor):
         except:
             return [11, 1, 13, 9, 21] # Fallback to major painting/print depts
 
+    
     def _get_department_ids(self, dept_id, headers):
         """Fetches every Object ID in a specific department."""
         url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects?departmentIds={dept_id}"
@@ -72,6 +100,7 @@ class MetIngestor(BaseIngestor):
         except:
             return []
 
+    
     def _get_object_metadata(self, oid, headers):
         """Fetches metadata with a strict rate-limit delay."""
         time.sleep(0.05) 
@@ -82,6 +111,7 @@ class MetIngestor(BaseIngestor):
         except:
             return None
 
+    
     def _is_valid_asset(self, metadata):
         """The gatekeeper: checks for curated artists and valid media."""
         artist = metadata.get('artistDisplayName', '')
