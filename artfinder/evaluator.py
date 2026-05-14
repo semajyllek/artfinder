@@ -206,50 +206,65 @@ def collect_eval_results(state, test_ids, nprobe=32, silent=True):
 
 
 
+
 def show_3panel(state, test_photo, meta, confidence, true_id):
     """
-    Generates a visual verification plot comparing the simulated query 
-    to the vault's best match.
+    Displays a 3-panel comparison: Input Photo, Predicted Match, and Ground Truth.
+    Updated to handle GUIDs (met_ / moma_) and prevent path collisions.
     """
     import matplotlib.pyplot as plt
     from PIL import Image
     from io import BytesIO
 
-    # 1. Resolve True Identity Image
-    true_row = state.source_df[state.source_df['id'] == str(true_id)].iloc[0]
-    true_url = str(true_row['url']).lower()
-    prefix = "met" if "metmuseum.org" in true_url else "moma" # Add "aic" if needed
+    # 1. Resolve Ground Truth Path
+    # If the ID is a GUID (has an underscore), use it directly. 
+    # Otherwise, assume it's a legacy MoMA integer.
+    true_id_str = str(true_id)
+    true_filename = f"{true_id_str}.jpg" if "_" in true_id_str else f"moma_{true_id_str}.jpg"
+    true_blob_path = f"images/{true_filename}"
     
-    true_blob = state.bucket.blob(f"images/{prefix}_{true_id}.jpg")
-    true_img = Image.open(BytesIO(true_blob.download_as_bytes()))
+    true_blob = state.bucket.blob(true_blob_path)
+    try:
+        true_img = Image.open(BytesIO(true_blob.download_as_bytes()))
+    except Exception as e:
+        print(f"❌ Error: Ground Truth image not found at {true_blob_path}")
+        return
 
-    # 2. Resolve Predicted Image (if any)
+    # 2. Resolve Predicted Match Path
     pred_img = None
     if meta:
-        pred_row = state.source_df[state.source_df['id'] == str(meta['id'])].iloc[0]
-        pred_url = str(pred_row['url']).lower()
-        p_prefix = "met" if "metmuseum.org" in pred_url else "moma"
-        pred_blob = state.bucket.blob(f"images/{p_prefix}_{meta['id']}.jpg")
-        pred_img = Image.open(BytesIO(pred_blob.download_as_bytes()))
+        pred_id_str = str(meta['id'])
+        pred_filename = f"{pred_id_str}.jpg" if "_" in pred_id_str else f"moma_{pred_id_str}.jpg"
+        pred_blob_path = f"images/{pred_filename}"
+        
+        try:
+            pred_blob = state.bucket.blob(pred_blob_path)
+            pred_img = Image.open(BytesIO(pred_blob.download_as_bytes()))
+        except Exception as e:
+            print(f"⚠️ Warning: Predicted image not found at {pred_blob_path}")
 
-    # 3. Plotting
-    fig, ax = plt.subplots(1, 3, figsize=(18, 6))
+    # 3. Plotting Logic
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     
-    ax[0].imshow(test_photo)
-    ax[0].set_title(f"Query (Simulated)\nTrue ID: {true_id}")
-    ax[0].axis('off')
-
-    ax[1].imshow(true_img)
-    ax[1].set_title(f"Vault Reference\n{true_row['title'][:30]}...")
-    ax[1].axis('off')
-
+    # Panel A: The Test Photo
+    axes[0].imshow(test_photo)
+    axes[0].set_title("Input (Test Photo)")
+    axes[0].axis('off')
+    
+    # Panel B: The Model's Prediction
     if pred_img:
-        ax[2].imshow(pred_img)
-        match_status = "✅ MATCH" if str(meta['id']) == str(true_id) else "❌ MISMATCH"
-        ax[2].set_title(f"{match_status}\nConf: {confidence:.2f}")
+        axes[1].imshow(pred_img)
+        title = f"Prediction: {meta.get('title', 'Unknown')}\nArtist: {meta.get('artist', 'Unknown')}\nConf: {confidence:.4f}"
+        axes[1].set_title(title)
     else:
-        ax[2].set_title("No Match Found")
-    ax[2].axis('off')
-
+        axes[1].text(0.5, 0.5, "Image Missing", ha='center', va='center')
+        axes[1].set_title("Prediction (Metadata only)")
+    axes[1].axis('off')
+    
+    # Panel C: Ground Truth (The original image in the vault)
+    axes[2].imshow(true_img)
+    axes[2].set_title(f"Ground Truth\nID: {true_id_str}")
+    axes[2].axis('off')
+    
     plt.tight_layout()
     plt.show()

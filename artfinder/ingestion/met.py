@@ -6,44 +6,94 @@ from tqdm.auto import tqdm
 from artfinder.ingestor import BaseIngestor
 from artfinder.engine import is_curated_artist
 
-class MetIngestor(BaseIngestor):
-    def fetch_delta(self, known_ids, limit=100):
-        headers = {'User-Agent': 'ArtFinder-Global/1.0'}
-        delta_rows = []
-        
-        # We iterate through your artists
-        artist_list = list(self.state.authority_set)
-        
-        for artist in tqdm(artist_list, desc="Deep Scanning Met"):
-            if len(delta_rows) >= limit: break
-            
-            # Use global search to find the artist anywhere in the metadata
-            search_url = f"https://collectionapi.metmuseum.org/public/collection/v1/search?hasImages=true&q={artist}"
-            try:
-                res = requests.get(search_url, headers=headers).json()
-                obj_ids = res.get('objectIDs', [])
-                if not obj_ids: continue
 
-                for oid in obj_ids[:10]: # Look deeper than top 3
-                    # THE GUID FIX: check against met_ prefixed IDs
-                    guid = f"met_{oid}"
-                    if guid in known_ids: continue
+class MetIngestor(BaseIngestor):
+    def fetch_delta(self, known_ids, limit=1000):
+        """
+        The master loop. It forces the search through all departments 
+        until it either hits the limit or runs out of IDs in the museum.
+        """
+        delta_rows = []
+        headers = {'User-Agent': 'ArtFinder-DeepVacuum/1.0'}
+        
+        all_depts = self._get_all_department_ids(headers)
+        
+        for dept_id in all_depts:
+            # Check limit at the start of every department
+            if len(delta_rows) >= limit:
+                break
+                
+            # Pass the delta_rows list into the processor to keep a running count
+            self._process_department(dept_id, known_ids, limit, delta_rows, headers)
                     
-                    time.sleep(0.05)
-                    d = requests.get(f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{oid}", headers=headers).json()
-                    
-                    # RELAXED FILTER: Catch anything by the artist that isn't a statue or a spoon
-                    if is_curated_artist(d.get('artistDisplayName', ''), self.state.authority_set):
-                        allowed_types = ['Paintings', 'Drawings', 'Watercolors', 'Pastels']
-                        if any(t in str(d.get('classification')) for t in allowed_types):
-                            delta_rows.append({
-                                'ObjectID': guid, # Use the Prefixed ID
-                                'Title':    d.get('title', 'Unknown'),
-                                'Artist':   d.get('artistDisplayName', artist),
-                                'ImageURL': d.get('primaryImageSmall', ''),
-                                'Source':   'met'
-                            })
-                            if len([r for r in delta_rows if r['Artist'] == d.get('artistDisplayName')]) >= 5:
-                                break
-            except: continue
         return pd.DataFrame(delta_rows)
+
+    def _process_department(self, dept_id, known_ids, limit, delta_rows, headers):
+        """
+        Walks a single department. Adds matches directly to the 
+        delta_rows list passed from the parent.
+        """
+        obj_ids = self._get_department_ids(dept_id, headers)
+        
+        # We reverse to hit higher-fidelity records first
+        for oid in tqdm(reversed(obj_ids), desc=f"Dept {dept_id}", total=len(obj_ids)):
+            # Hard exit if we hit the limit mid-department
+            if len(delta_rows) >= limit:
+                return
+
+            guid = f"met_{oid}"
+            if guid in known_ids:
+                continue
+                
+            metadata = self._get_object_metadata(oid, headers)
+            if metadata and self._is_valid_asset(metadata):
+                delta_rows.append({
+                    'ObjectID': guid,
+                    'Title':    metadata.get('title', 'Unknown'),
+                    'Artist':   metadata.get('artistDisplayName', 'Unknown'),
+                    'ImageURL': metadata.get('primaryImageSmall', ''),
+                    'Source':   'met'
+                })
+
+    def _get_all_department_ids(self, headers):
+        """Fetches all 19+ departments from the Met."""
+        try:
+            url = "https://collectionapi.metmuseum.org/public/collection/v1/departments"
+            resp = requests.get(url, headers=headers, timeout=10).json()
+            return [d['departmentId'] for d in resp.get('departments', [])]
+        except:
+            return [11, 1, 13, 9, 21] # Fallback to major painting/print depts
+
+    def _get_department_ids(self, dept_id, headers):
+        """Fetches every Object ID in a specific department."""
+        url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects?departmentIds={dept_id}"
+        try:
+            return requests.get(url, headers=headers, timeout=10).json().get('objectIDs', [])
+        except:
+            return []
+
+    def _get_object_metadata(self, oid, headers):
+        """Fetches metadata with a strict rate-limit delay."""
+        time.sleep(0.05) 
+        url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{oid}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            return resp.json() if resp.status_code == 200 else None
+        except:
+            return None
+
+    def _is_valid_asset(self, metadata):
+        """The gatekeeper: checks for curated artists and valid media."""
+        artist = metadata.get('artistDisplayName', '')
+        # Only process if we have a name and an image
+        if not artist or not metadata.get('primaryImageSmall'):
+            return False
+            
+        # 1. Standardize artist name and check curated list
+        if not is_curated_artist(artist, self.state.authority_set):
+            return False
+            
+        # 2. Check classification
+        cls = str(metadata.get('classification', ''))
+        valid_types = ['Paintings', 'Drawings', 'Watercolors', 'Pastels', 'Prints']
+        return any(t in cls for t in valid_types)
