@@ -8,6 +8,9 @@ from google.cloud import storage
 from google.colab import auth
 from fuzzywuzzy import fuzz
 from .config import Config
+import faiss
+import numpy as np
+
 
 @dataclass
 class SearchEngineState:
@@ -19,6 +22,45 @@ class SearchEngineState:
     index:     object = None
     source_df: object = None
     id_map:    object = None
+
+
+
+def build_search_indices(state):
+    """
+    Performs K-means clustering on vaulted vectors to create an IVF index.
+    Essential for scaling toward the 50,000 image limit.
+    """
+    # 1. Recover the raw vectors from the vault
+    from .ingestor import recover_state
+    _, master_index = recover_state(state)
+    
+    # Extract the underlying data as a numpy array
+    # IndexBinaryFlat stores data in a way that allows reconstruction
+    n_total = master_index.ntotal
+    print(f"Reconstructing {n_total:,} vectors for training...")
+    
+    # Get all vectors (MoMA + Met)
+    all_vectors = master_index.reconstruct_n(0, n_total)
+    
+    # 2. Configure the IVF Index
+    # We use 4096 centroids to maintain high speed as we hit 50k images
+    quantizer = faiss.IndexBinaryFlat(Config.DIMENSION)
+    index_ivf = faiss.IndexBinaryIVF(quantizer, Config.DIMENSION, 4096)
+    
+    # 3. Train the Index
+    # This is the 'Brain Training'—it groups similar visual features together
+    print(f"Training IVF Index with 4096 centroids...")
+    index_ivf.train(all_vectors)
+    
+    # 4. Add the vectors to the new structure
+    print("Populating IVF Index...")
+    index_ivf.add(all_vectors)
+    
+    # 5. Save locally
+    faiss.write_index_binary(index_ivf, Config.LOCAL_INDEX)
+    state.index = index_ivf
+    print(f"✅ Search Index rebuilt successfully with {index_ivf.ntotal:,} vectors.")
+
 
 def setup_gcs():
     auth.authenticate_user()
