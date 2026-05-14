@@ -1,0 +1,12 @@
+pandas
+numpy
+faiss-cpu
+opencv-python-headless
+Pillow
+tqdm
+pyarrow
+gcsfs
+fuzzywuzzy
+python-Levenshtein
+matplotlib
+google-cloud-storage
