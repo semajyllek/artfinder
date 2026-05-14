@@ -1,6 +1,7 @@
 import pandas as pd
-from ..ingestor import BaseIngestor, resolve_image_url
-from ..engine import is_curated_artist
+
+from artfinder.ingestor import BaseIngestor
+from artfinder.engine import is_curated_artist
 
 class MoMAIngestor(BaseIngestor):
     def fetch_delta(self, known_ids, limit=100):

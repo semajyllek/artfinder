@@ -1,7 +1,9 @@
 import requests
 import pandas as pd
-from .ingestor import BaseIngestor
-from .engine import is_curated_artist
+
+from artfinder.ingestor import BaseIngestor
+from artfinder.engine import is_curated_artist
+
 
 class MetIngestor(BaseIngestor):
     def fetch_delta(self, known_ids, limit=100):
