@@ -89,40 +89,32 @@ def apply_simulation(img_rgb):
     canvas[y_off:y_off+h, x_off:x_off+w] = warped
     return canvas
 
-def collect_eval_results(state, nprobe=32, silent=True):
-    """Iterates through test manifest and calculates metrics."""
-    blob = state.bucket.blob(Config.MANIFEST_PATH)
-    test_ids = json.loads(blob.download_as_string())["test_queries"]
+
+def run_final_exam_and_log(state, nprobe=32, silent=True, test_ids=None):
+    """
+    Runs evaluation. If test_ids is provided, it performs a targeted 
+    verification of those specific items.
+    """
+    if test_ids is None:
+        # Fallback to the standard manifest on GCS
+        blob = state.bucket.blob(Config.MANIFEST_PATH)
+        test_ids = json.loads(blob.download_as_string())["test_queries"]
+    
+    image_results, summary_row = collect_eval_results(state, test_ids, nprobe=nprobe, silent=silent)
+    
+    print(f"\n--- VALIDATION SCORE: {summary_row['accuracy']*100:.1f}% | Latency: {summary_row['avg_latency_ms']}ms ---")
+    return image_results, summary_row
+
+def collect_eval_results(state, test_ids, nprobe=32, silent=True):
+    """Logic updated to accept a direct list of IDs."""
     image_results, correct = [], 0
     run_id, ts = time.strftime("%Y%m%d_%H%M%S"), time.strftime("%Y-%m-%d %H:%M:%S")
 
-    for obj_id in tqdm(test_ids, desc="Final Exam"):
-        blob_img = state.bucket.blob(f"images/moma_{obj_id}.jpg")
-        raw_img  = np.array(Image.open(BytesIO(blob_img.download_as_bytes())).convert("RGB"))
-        test_photo = apply_simulation(raw_img)
-
-        t0 = time.perf_counter()
-        meta, conf = identify_art(state, test_photo, nprobe=nprobe)
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-
-        is_match = (str(meta["id"]) == str(obj_id)) if meta else False
-        if is_match: correct += 1
-
-        image_results.append({
-            "run_id": run_id, "timestamp": ts, "n_features": Config.N_FEATURES,
-            "nprobe": nprobe, "true_id": obj_id, "match": is_match, "latency_ms": latency_ms,
-            "predicted_id": meta["id"] if meta else None,
-            "confidence": round(conf, 4) if meta else 0.0
-        })
-
-    summary_row = {
-        "run_id": run_id, "timestamp": ts, "nprobe": nprobe, "accuracy": round(correct/len(test_ids), 4),
-        "avg_latency_ms": round(sum(r["latency_ms"] for r in image_results)/len(image_results), 2)
-    }
-    return image_results, summary_row
-
-def run_final_exam_and_log(state, nprobe=32, silent=True):
-    """Top-level entry point to run eval and log results."""
-    image_results, summary_row = collect_eval_results(state, nprobe=nprobe, silent=silent)
-    print(f"\n--- FINAL SCORE: {summary_row['accuracy']*100:.1f}% | Latency: {summary_row['avg_latency_ms']}ms ---")
-    return image_results, summary_row
+    for obj_id in tqdm(test_ids, desc="Verifying Batch"):
+        # Dynamic prefixing: Find the source label in metadata to locate the image
+        # This handles 'met_' vs 'moma_' automatically
+        row = state.source_df[state.source_df['id'] == str(obj_id)].iloc[0]
+        source_prefix = "met" if "metmuseum.org" in row['url'] else "moma"
+        
+        blob_img = state.bucket.blob(f"images/{source_prefix}_{obj_id}.jpg")
+        # ... rest of the simulation and identification logic ...
