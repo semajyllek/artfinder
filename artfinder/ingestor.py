@@ -56,6 +56,37 @@ def onboard_artwork(row, master_index, state):
     except: return None
     return None
 
+
+
+def get_vault_stats(state):
+    """Calculates total vectors currently in the binary vault."""
+    _, master_index = recover_state(state)
+    print(f"total vectors in vault: {master_index.ntotal:,}")
+    return master_index.ntotal
+
+def get_index_density(state):
+    """Reports the average number of ORB features per artwork."""
+    source_df      = load_source_metadata(state.bucket)
+    total_paintings = len(source_df)
+
+    _, master_index = recover_state(state)
+    total_vectors   = master_index.ntotal
+
+    if total_paintings == 0:
+        return 0
+
+    avg_features = total_vectors / total_paintings
+    print(f"--- Index Density Report ---")
+    print(f"total paintings: {total_paintings:,}")
+    print(f"total vectors:   {total_vectors:,}")
+    print(f"avg features:    {avg_features:.2f} per painting")
+
+    return avg_features
+
+
+
+
+
 def run_sync_cycle(state):
     source_df, master_index = recover_state(state)
     potential = state.df_moma[state.df_moma['ImageURL'].str.contains(r'\.jpg|\.jpeg|\.png|media\.moma\.org', case=False, na=False)].copy()
