@@ -2,6 +2,7 @@ import time
 import requests
 import pandas as pd
 
+from tqdm.auto import tqdm
 from artfinder.ingestor import BaseIngestor
 from artfinder.engine import is_curated_artist
 
