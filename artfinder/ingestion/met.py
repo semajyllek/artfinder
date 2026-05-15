@@ -62,28 +62,29 @@ class MetIngestor(BaseIngestor):
         if metadata and self._is_valid_asset(metadata, authority_lookup):
             self._append_to_harvest(guid, metadata, delta_rows)
 
+
     def _is_valid_asset(self, metadata, authority_lookup):
-        # 1. Image Check (Fastest)
-        if not metadata.get('primaryImageSmall'):
-            return False
-
-        # 2. Artist Check (The Fix)
-        raw_artist = str(metadata.get('artistDisplayName', '')).lower().strip()
-        if not raw_artist:
-            return False
-        
-        # Check if any artist in our curated list appears anywhere in the Met's string
-        # This turns your 0% yield into a 100% yield for valid masters.
-        is_curated = any(curated_name in raw_artist for curated_name in authority_lookup)
+        artist = str(metadata.get('artistDisplayName', '')).lower()
     
-        if not is_curated:
+        # Check 1: Image
+        if not metadata.get('primaryImageSmall'):
+            print(f"DEBUG: Rejected {metadata.get('objectID')} - No Image")
             return False
 
-        # 3. Classification Check (Broadened)
+        # Check 2: Artist Substring
+        is_curated = any(curated_name in artist for curated_name in authority_lookup)
+        if not is_curated:
+            print(f"DEBUG: Rejected {metadata.get('objectID')} - Artist mismatch: '{artist}'")
+            return False
+
+        # Check 3: Classification
         cls = str(metadata.get('classification', '')).lower()
         valid_types = ['paintings', 'drawings', 'watercolors', 'pastels', 'prints']
-        return any(t in cls for t in valid_types)
+        if not any(t in cls for t in valid_types):
+            print(f"DEBUG: Rejected {metadata.get('objectID')} - Bad Class: '{cls}'")
+            return False
 
+        return True
 
     def _get_object_metadata(self, oid, headers):
         """Fetches raw metadata with politeness delay."""
