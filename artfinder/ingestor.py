@@ -47,7 +47,7 @@ class BaseIngestor(ABC):
         if cache:
             vault_checkpoint(self.state, cache, master_index)
 
-# ─── CORE VAULT LOGIC (Original Notebook Logic) ──────────────────────────────
+# ─── CORE VAULT LOGIC ────────────────────────────────────────────────────────
 
 def load_source_metadata(bucket):
     """Downloads source_metadata.parquet from GCS."""
@@ -58,7 +58,10 @@ def load_source_metadata(bucket):
     return pd.DataFrame(columns=['id', 'title', 'artist', 'url', 'start_row', 'end_row'])
 
 def recover_state(state):
-    """Recovers metadata and the binary vector vault from GCS."""
+    """
+    Recovers metadata and the binary vector vault from GCS.
+    Automatically initializes the native integer ID mapping layout array.
+    """
     source_df = load_source_metadata(state.bucket)
     blob = state.bucket.blob(Config.VAULT_PATH)
     if blob.exists():
@@ -66,10 +69,20 @@ def recover_state(state):
         master_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     else:
         master_index = faiss.IndexBinaryFlat(Config.DIMENSION)
+        
+    state.source_df = source_df
+    state.index = master_index
+    
+    # Sync and type the memory map mapping array on state restoration
+    sync_runtime_integer_map(state, master_index)
+    
     return source_df, master_index
 
 def vault_checkpoint(state, new_records, master_index):
-    """Saves progress to GCS to prevent data loss during long syncs."""
+    """
+    Saves progress to GCS to prevent data loss during long syncs.
+    Automatically regenerates and synchronizes the active runtime integer map.
+    """
     if not new_records: return
     current_source = load_source_metadata(state.bucket)
     updated_source = pd.concat([current_source, pd.DataFrame(new_records)], ignore_index=True)
@@ -79,6 +92,53 @@ def vault_checkpoint(state, new_records, master_index):
 
     faiss.write_index_binary(master_index, Config.LOCAL_VAULT)
     state.bucket.blob(Config.VAULT_PATH).upload_from_filename(Config.LOCAL_VAULT)
+    
+    # Enforce active context updates to synchronize the dynamic state frame fields
+    state.source_df = updated_source
+    state.index = master_index
+    
+    sync_runtime_integer_map(state, master_index)
+
+def sync_runtime_integer_map(state, master_index=None):
+    """
+    High-speed mapping utility function. Converts alphanumeric string unique tracking keys 
+    into contiguous native standard integer indices matching DataFrame sequence rows.
+    Prevents runtime casting exceptions when running vector vote-tally calculations.
+    """
+    if state.source_df is None or state.source_df.empty:
+        return
+
+    active_index = master_index if master_index is not None else state.index
+    if active_index is None:
+        return
+
+    max_row = int(state.source_df['end_row'].max()) if not state.source_df['end_row'].isna().all() else 0
+    if max_row == 0 and active_index.ntotal == 0:
+        state.id_map = np.zeros(0, dtype=np.int64)
+        return
+
+    # Build direct map: String Asset ID -> DataFrame Integer Row Index 
+    id_to_row_idx = {str(uid): i for i, uid in enumerate(state.source_df['id'])}
+    
+    # Initialize native 64-bit integer tracking continuous vector lane slots
+    id_map_ints = np.zeros(max_row + 1, dtype=np.int64)
+
+    for _, row in state.source_df.iterrows():
+        if pd.isna(row['start_row']) or pd.isna(row['end_row']):
+            continue
+        
+        # Pull matching unique matrix registration location coordinates
+        current_row_index = id_to_row_idx[str(row['id'])]
+        
+        # Populate whole feature vector span block directly with row key reference numbers
+        id_map_ints[int(row['start_row']):int(row['end_row']) + 1] = current_row_index
+
+    # Bind elements straight back into core state attributes
+    state.id_map = id_map_ints
+    state.index = active_index
+
+
+# ─── PIPELINE ATTACHMENT LOGIC ───────────────────────────────────────────────
 
 def resolve_image_url(row):
     """Identifies direct image assets from source rows."""
@@ -88,7 +148,6 @@ def resolve_image_url(row):
             if any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png']) or "media.moma.org" in url:
                 return url
     return None
-
 
 def onboard_artwork(row, master_index, state):
     """
@@ -118,8 +177,6 @@ def onboard_artwork(row, master_index, state):
             master_index.add(des)
 
             # 3. FIXED PATH LOGIC: Prevent double-prefixing
-            # If obj_id already has an underscore (met_123), use it directly.
-            # If not, it's a legacy ID (123), so append source_label (moma_123).
             filename = f"{obj_id}.jpg" if "_" in obj_id else f"{source_label}_{obj_id}.jpg"
             blob = state.bucket.blob(f"images/{filename}")
             
@@ -137,9 +194,6 @@ def onboard_artwork(row, master_index, state):
         print(f"Error onboarding {obj_id}: {e}")
         return None
     return None
-
-
-
 
 
 # ─── REPORTING HELPERS ───────────────────────────────────────────────────────
