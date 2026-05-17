@@ -101,25 +101,55 @@ class VaultBuilder:
         return None
 
 
-    # ─── FOCUSED SOURCE ADAPTER GENERATORS ────────────────────────────────────
+    # ─── FOCUSED SOURCE ADAPTER GENERATORS WITH INTEGRATED AUTHORITY GATING ───
 
     @staticmethod
-    def parse_hf_dataset(hf_split):
-        """Yields standardized dictionary footprints directly out of Hugging Face sets."""
+    def parse_hf_dataset(hf_split, authority_set=None):
+        """
+        Yields standardized dictionary footprints directly out of Hugging Face sets.
+        Integrates robust substring matching rules against your target authority list.
+        """
+        artist_names = hf_split.features['artist'].names
+
         for idx, item in enumerate(hf_split):
+            # 1. Extract raw strings
+            a_idx = item.get('artist', 'Unlinked')
+            artist_raw = artist_names[a_idx] if isinstance(a_idx, int) else str(a_idx)
+            title_str = str(item.get('title', 'Unlinked'))
+
+            # 2. Replicate robust normalization matching
+            artist_normalized = artist_raw.lower().replace('-', ' ').strip()
+
+            if authority_set is not None:
+                # Reusing your exact robust string matching substring heuristic
+                is_curated = any(curated_name in artist_normalized for curated_name in authority_set)
+                if not is_curated:
+                    continue  # Gate out unlisted artists instantly
+
             yield {
                 'visual_id': f"vis_hf_{idx}",
                 'image': item.get('image'),
-                'title': str(item.get('title', 'Unlinked')).strip(),
-                'artist': str(item.get('artist', 'Unlinked')).strip(),
+                'title': title_str.strip(),
+                'artist': artist_raw.replace('-', ' ').title(),
                 'filename': f"vis_hf_{idx}.jpg"
             }
 
     @staticmethod
-    def parse_csv_urls(csv_path, id_col, url_col, title_col, artist_col, timeout=10):
-        """Yields standard payloads by downloading runtime assets from an arbitrary CSV file."""
+    def parse_csv_urls(csv_path, id_col, url_col, title_col, artist_col, authority_set=None, timeout=10):
+        """
+        Yields standard payloads by downloading runtime assets from an arbitrary CSV file.
+        Filters out uncurated entries prior to establishing network connections.
+        """
         df = pd.read_csv(csv_path)
         for _, row in df.iterrows():
+            artist_raw = str(row[artist_col]).strip()
+            artist_normalized = artist_raw.lower().strip()
+
+            if authority_set is not None:
+                is_curated = any(curated_name in artist_normalized for curated_name in authority_set)
+                if not is_curated:
+                    continue
+
             obj_id = str(row[id_col]).strip()
             url = str(row[url_col]).strip()
             
@@ -132,31 +162,25 @@ class VaultBuilder:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     pil_img = Image.open(BytesIO(resp.read()))
             except Exception:
-                # Cleanly bypass broken row paths or connection handshakes
                 continue
 
             yield {
                 'visual_id': f"vis_csv_{obj_id}",
                 'image': pil_img,
                 'title': str(row[title_col]).strip(),
-                'artist': str(row[artist_col]).strip(),
+                'artist': artist_raw.title(),
                 'filename': f"vis_csv_{obj_id}.jpg"
             }
 
     @staticmethod
-    def parse_local_directory(image_dir):
-        """Yields standard schemas from physical disk folder components."""
+    def parse_local_directory(image_dir, authority_set=None):
+        """Yields standard schemas from physical disk folder components, gated by authority targets."""
         valid_exts = ('.jpg', '.jpeg', '.png', '.webp')
         all_files = [f for f in os.listdir(image_dir) if f.lower().endswith(valid_exts)]
         
         for filename in all_files:
             full_path = os.path.join(image_dir, filename)
             base_name = filename.rsplit('.', 1)[0]
-            
-            try:
-                pil_img = Image.open(full_path)
-            except Exception:
-                continue
 
             # Parse string segments using tokenized formatting rules
             artist, title = "Unknown Artist", base_name.replace('-', ' ').title()
@@ -164,6 +188,17 @@ class VaultBuilder:
                 parts = base_name.split('_', 1)
                 artist = parts[0].replace('-', ' ').title()
                 title = parts[1].replace('-', ' ').title()
+
+            artist_normalized = artist.lower().strip()
+            if authority_set is not None:
+                is_curated = any(curated_name in artist_normalized for curated_name in authority_set)
+                if not is_curated:
+                    continue
+
+            try:
+                pil_img = Image.open(full_path)
+            except Exception:
+                continue
 
             yield {
                 'visual_id': f"vis_local_{base_name}",
@@ -177,17 +212,12 @@ class VaultBuilder:
 # ─── OPTIMIZED IVF COMPRESSION & GCS SYNC AT SCALE ───────────────────────────
 
 def build_optimized_search_index(state, n_centroids=4096):
-    """
-    Transforms flat master index paths into an IVF Inverted cluster array.
-    Trains locally to protect RAM overhead, then writes and pushes the final array to GCS.
-    """
+    """Transforms flat master index paths into an IVF Inverted cluster array and syncs to GCS."""
     import faiss
     
-    # Bring up current master index tracking state
     _, master_index = recover_state(state)
     n_total = master_index.ntotal
     
-    # IVF structural boundaries require strict density minimums for stability
     if n_total < n_centroids * 39:
         print(f"⚠️ Vector collection length ({n_total:,}) is too shallow to train {n_centroids} clusters effectively.")
         return
@@ -195,7 +225,6 @@ def build_optimized_search_index(state, n_centroids=4096):
     print(f"Reconstructing array layouts for {n_total:,} visual features...")
     all_vectors = master_index.reconstruct_n(0, n_total)
     
-    # Train Inverted File Index array structure
     quantizer = faiss.IndexBinaryFlat(Config.DIMENSION)
     index_ivf = faiss.IndexBinaryIVF(quantizer, Config.DIMENSION, n_centroids)
     
@@ -203,11 +232,9 @@ def build_optimized_search_index(state, n_centroids=4096):
     index_ivf.train(all_vectors)
     index_ivf.add(all_vectors)
     
-    # Save compilation binary locally
     faiss.write_index_binary(index_ivf, Config.LOCAL_INDEX)
     print("✅ Index compression completed locally.")
     
-    # Sync the compiled live production binary up to your cloud bucket
     _upload_index_to_gcs(state, Config.LOCAL_INDEX, Config.INDEX_PATH)
 
 
