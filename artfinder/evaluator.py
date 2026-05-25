@@ -184,12 +184,20 @@ def load_production_brain(state):
 
 
 def execute_live_notebook_benchmark(state, sample_size=100):
-    """Evaluates indexes utilizing native vector reconstructions out of the FAISS arrays."""
+    """
+    Evaluates engine index search performance utilizing native FAISS vector 
+    reconstructions and renders a structured visual health dashboard.
+    """
     import time
-    # 🌟 FIXED: Points to the new consolidated vault builder location
+    import random
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from .config import Config
     from .vault.builder import recover_state
+    
     df_meta = state.source_df
-    if df_meta.empty:
+    if df_meta is None or df_meta.empty:
+        print("⚠️ State metadata is currently empty. Aborting benchmark run.")
         return 0.0, 0.0
         
     valid_records = df_meta.dropna(subset=['id']).to_dict('records')
@@ -201,6 +209,7 @@ def execute_live_notebook_benchmark(state, sample_size=100):
     correct_matches = 0
     total_latency_ms = 0.0
     
+    # Recover state array mappings natively
     _, master_index = recover_state(state)
     
     for record in test_samples:
@@ -222,8 +231,47 @@ def execute_live_notebook_benchmark(state, sample_size=100):
         if start_r <= I[0][0] <= end_r:
             correct_matches += 1
 
-    return (correct_matches / sample_size) if sample_size > 0 else 0.0, (total_latency_ms / sample_size) if sample_size > 0 else 0.0
+    # Calculate final scaled metrics
+    final_accuracy = (correct_matches / sample_size) * 100 if sample_size > 0 else 0.0
+    avg_latency = (total_latency_ms / sample_size) if sample_size > 0 else 0.0
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # RENDER VISUAL DASHBOARD REPORT
+    # ──────────────────────────────────────────────────────────────────────────
+    print("\n🏁 ================================================== 🏁")
+    print("📈 --- ARTFINDER RUNTIME PERFORMANCE DASHBOARD --- 📈")
+    print("======================================================")
+    print(f"  • Total Images Evaluated:   {sample_size:,}")
+    print(f"  • Total Successful Matches: {correct_matches} / {sample_size}")
+    print(f"  • Match Verification Rate:  {final_accuracy:.2f}%")
+    print(f"  • Average Lookup Latency:   {avg_latency:.2f} ms")
+    print("======================================================\n")
+
+    # Render a dual-metric horizontal gauge panel
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 2.5))
+    
+    # Panel 1: Accuracy Bar
+    acc_color = '#2ecc71' if final_accuracy >= 90 else ('#f1c40f' if final_accuracy >= 70 else '#e74c3c')
+    ax1.barh(['Accuracy'], [final_accuracy], color=acc_color, edgecolor='#2c3e50', height=0.5)
+    ax1.set_xlim(0, 100)
+    ax1.set_xlabel('Percentage (%)')
+    ax1.set_title(f'Target Accuracy: {final_accuracy:.1f}%')
+    ax1.grid(axis='x', linestyle='--', alpha=0.5)
+
+    # Panel 2: Latency Speed Bar (Target under 50ms)
+    lat_color = '#2ecc71' if avg_latency <= 35 else ('#f1c40f' if avg_latency <= 100 else '#e74c3c')
+    # Use logarithmic or bounded spacing to display speed safely
+    max_plot_speed = max(100, avg_latency * 1.5)
+    ax2.barh(['Latency'], [avg_latency], color=lat_color, edgecolor='#2c3e50', height=0.5)
+    ax2.set_xlim(0, max_plot_speed)
+    ax2.set_xlabel('Time (ms)')
+    ax2.set_title(f'Search Speed: {avg_latency:.2f} ms')
+    ax2.grid(axis='x', linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.show()
+
+    return final_accuracy, avg_latency
 
 def execute_visual_3panel_validation(state, num_displays=3, nprobe=8):
     """
