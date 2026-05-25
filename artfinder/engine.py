@@ -45,11 +45,22 @@ def setup_gcs():
     bucket = client.get_bucket(Config.BUCKET_NAME)
     return client, bucket
 
+
 def build_authority_set():
+    """
+    Downloads the master artist list and flattens all string entries 
+    to lowercase to ensure flawless matching against incoming image streams.
+    """
+    import urllib.request
+    import csv
+    
     AUTH_URL = "https://raw.githubusercontent.com/oobabooga/stable-diffusion-automatic/master/artists.csv"
     with urllib.request.urlopen(AUTH_URL) as response:
         lines = [line.decode('utf-8') for line in response.readlines()]
-    return {row['artist'].lower().strip() for row in csv.DictReader(lines)}
+    
+    # 🌟 FIXED: Force the entire set comprehension to be lowercase
+    return {row['artist'].lower().strip() for row in csv.DictReader(lines) if 'artist' in row}
+
 
 def initialize_engine():
     client, bucket = setup_gcs()
