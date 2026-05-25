@@ -1,14 +1,13 @@
 import os
 import gc
 import cv2
-import queue
 import faiss
 import numpy as np
 import pandas as pd
 from io import BytesIO
 from PIL import Image
 from tqdm.auto import tqdm
-from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Pool, cpu_count
 from ..config import Config
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -100,21 +99,61 @@ def purge_gcs_production_vault(state):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. CONCURRENT INGESTION BUILDER ENGINE
+# 3. CORE PROCESS WORKER FLIGHT CELL (Executed in isolated CPU cores)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _extract_features_worker(record_batch):
+    """
+    Isolated worker function that runs on an independent CPU core.
+    Processes a localized chunk of records, completely bypassing the GIL.
+    """
+    # Re-instantiate local ORB descriptors per process workspace
+    local_orb = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8, WTA_K=2)
+    processed_results = []
+    
+    for record in record_batch:
+        try:
+            img_np = record['image']
+            
+            # Defensive verification of data structure
+            if not isinstance(img_np, np.ndarray):
+                continue
+
+            resized = cv2.resize(img_np, (300, 300))  # Matches Config.RESIZE_DIM
+            kp, des = local_orb.detectAndCompute(resized, None)
+            
+            if des is not None and len(des) > 0:
+                # Compress the image to JPEG bytes right inside the worker core
+                # to offload overhead from the parent coordination process
+                buffer = BytesIO()
+                Image.fromarray(img_np).save(buffer, format="JPEG", quality=85)
+                
+                processed_results.append({
+                    'visual_id': record['visual_id'],
+                    'title': record['title'],
+                    'artist': record['artist'],
+                    'url': record.get('SourceURL', 'https://www.wikiart.org'),
+                    'descriptors': des,
+                    'image_bytes': buffer.getvalue()
+                })
+        except Exception:
+            continue
+            
+    return processed_results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. PARALLEL BATCH INGESTION DRIVER
 # ──────────────────────────────────────────────────────────────────────────────
 
 class VaultBuilder:
-    """
-    Accelerated execution engine for building the core visual database.
-    Implements a multi-threaded bounded producer/consumer queue to separate 
-    stream I/O fetching operations from heavy local CPU feature calculations.
-    """
     def __init__(self, state):
         self.state = state
 
     def ingest_stream(self, data_stream, batch_name, total_records=None):
         """
-        Ingestion gateway optimized with an asynchronous background thread pool.
+        Ingestion gateway optimized with true multi-processing.
+        Chunks stream layers and maps feature computation across all available CPU cores.
         """
         _, master_index = recover_state(self.state)
         
@@ -125,106 +164,108 @@ class VaultBuilder:
             known_ids = set()
 
         cache = []
-        
-        # Telemetry Runtime Trackers
         total_scanned = 0
         total_matched = 0
         unique_artists = set()
-
-        # Instantiate a bounded thread-safe Queue to prevent runtime memory spikes
-        # Holds up to 150 items max in RAM before forcing producer workers to pause
-        img_queue = queue.Queue(maxsize=150)
-
-        # 🚀 Worker A: Background Producer Thread
-        def producer_worker():
-            try:
-                for record in data_stream:
-                    visual_id = record.get('visual_id')
-                    if visual_id and visual_id not in known_ids:
-                        img_queue.put(record)
-            except Exception as producer_err:
-                print(f"\n⚠️ Error inside background stream producer: {producer_err}")
-            finally:
-                # Always inject a termination sentinel block to alert the consumer
-                img_queue.put(None)
-
-        print(f"🚀 Initializing unified ingestion loop for batch: {batch_name}")
-        print("🧵 Spinning up asynchronous background stream producer thread...")
         
-        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="StreamProducer")
-        executor.submit(producer_worker)
+        # Hardware topology configuration metrics
+        num_cores = max(1, cpu_count() - 1)
+        chunk_size = 64  # Size of task allocations pushed to individual workers
+        accumulator = []
 
-        # 🔥 Worker B: Main Thread Consumer Loop (Dedicated entirely to ORB math)
-        with tqdm(desc=f"Vaulting {batch_name}", total=total_records) as pbar:
-            while True:
-                record = img_queue.get()
-                if record is None:  # Termination sentinel received, shutdown loop
-                    break
+        print(f"🚀 Initializing parallel multi-core engine for batch: {batch_name}")
+        print(f"💥 Spawning ProcessPool mapping layout across {num_cores} active CPU cores...")
+
+        with Pool(processes=num_cores) as pool, tqdm(desc=f"Vaulting {batch_name}", total=total_records) as pbar:
+            
+            for record in data_stream:
+                visual_id = record.get('visual_id')
+                if visual_id in known_ids:
+                    continue
                 
+                # Strip unpicklable objects out before crossing process boundary structures
+                if isinstance(record['image'], Image.Image):
+                    record['image'] = np.array(record['image'].convert('RGB'))
+                
+                accumulator.append(record)
                 total_scanned += 1
-                pbar.update(1)
                 
                 if 'artist' in record:
                     unique_artists.add(record['artist'])
 
-                try:
-                    pil_img = record['image']
-                    if isinstance(pil_img, Image.Image):
-                        img_np = np.array(pil_img.convert('RGB'))
-                    else:
-                        continue
+                # When your accumulator allocation matches your core capacity, distribute workload
+                if len(accumulator) >= (chunk_size * num_cores):
+                    # Subdivide master batch into localized chunks
+                    micro_chunks = [accumulator[i:i + chunk_size] for i in range(0, len(accumulator), chunk_size)]
+                    
+                    # Map task payloads to worker cores
+                    parallel_outputs = pool.map(_extract_features_worker, micro_chunks)
+                    
+                    # Reduce Phase: Synchronized main thread collects outputs, updates FAISS index & GCS
+                    for core_output in parallel_outputs:
+                        for item in core_output:
+                            total_matched += 1
+                            start_row = master_index.ntotal
+                            master_index.add(item['descriptors'])
+                            
+                            # Fire compressed payload to target cloud targets
+                            filename = f"{item['visual_id']}.jpg"
+                            blob = self.state.bucket.blob(f"images/{filename}")
+                            blob.upload_from_string(item['image_bytes'], content_type='image/jpeg')
+                            
+                            cache.append({
+                                'id': item['visual_id'],
+                                'title': str(item['title']),
+                                'artist': str(item['artist']),
+                                'url': item['url'],
+                                'start_row': start_row,
+                                'end_row': master_index.ntotal - 1
+                            })
+                    
+                    pbar.update(len(accumulator))
+                    accumulator = []  # Clear memory allocations
 
-                    # Execute CPU Bound image resizing and ORB tracking calculations
-                    resized = cv2.resize(img_np, Config.RESIZE_DIM)
-                    kp, des = self.state.orb.detectAndCompute(resized, None)
-
-                    if des is not None and len(des) > 0:
-                        total_matched += 1
-                        start_row = master_index.ntotal
-                        master_index.add(des)
-
-                        # Package compressed image bytes and pipe upstream to GCS
-                        buffer = BytesIO()
-                        pil_img.convert('RGB').save(buffer, format="JPEG", quality=85)
-                        content = buffer.getvalue()
-
-                        filename = f"{record['visual_id']}.jpg"
-                        blob = self.state.bucket.blob(f"images/{filename}")
-                        blob.upload_from_string(content, content_type='image/jpeg')
-
-                        cache.append({
-                            'id': record['visual_id'],
-                            'title': str(record['title']),
-                            'artist': str(record['artist']),
-                            'url': record.get('SourceURL', 'https://www.wikiart.org'),
-                            'start_row': start_row,
-                            'end_row': master_index.ntotal - 1
-                        })
-
-                    # Safely dispatch live dashboards every 1,000 processed items
-                    if total_scanned % 1000 == 0:
-                        print(f"\n✨ --- CONCURRENT DASHBOARD [Records Scanned: {total_scanned:,}] --- ✨")
-                        print(f"  • Total Artworks Vaulted:  {total_matched:,}")
-                        print(f"  • Unique Artists Ingested: {len(unique_artists):,}")
-                        if unique_artists:
-                            print(f"  • Sample Active Artists:   {', '.join(list(unique_artists)[-5:])}")
-                        print("─" * 60)
-
+                    # Evaluate checkpoint threshold intervals
                     if len(cache) >= Config.CHECKPOINT_SIZE:
                         vault_checkpoint(self.state, cache, master_index)
                         print(f"\n💾 Flushing safe checkpoint slice to GCS. Index length: {master_index.ntotal:,}")
                         cache = []
                         gc.collect()
 
-                except Exception as e:
-                    print(f"Error onboarding asset {record.get('visual_id', 'Unknown')}: {e}")
-                    continue
+                    # Render live terminal performance reports safely between lines
+                    print(f"\n✨ --- PARALLEL DASHBOARD [Processed: {total_scanned:,}] --- ✨")
+                    print(f"  • Total Artworks Vaulted:  {total_matched:,}")
+                    print(f"  • Unique Artists Ingested: {len(unique_artists):,}")
+                    if unique_artists:
+                        print(f"  • Sample Active Artists:   {', '.join(list(unique_artists)[-5:])}")
+                    print("─" * 60)
 
-        # Final collection clean sweep
+            # Flush remaining elements sitting inside trailing accumulators
+            if accumulator:
+                leftover_chunks = [accumulator[i:i + chunk_size] for i in range(0, len(accumulator), chunk_size)]
+                parallel_outputs = pool.map(_extract_features_worker, leftover_chunks)
+                for core_output in parallel_outputs:
+                    for item in core_output:
+                        start_row = master_index.ntotal
+                        master_index.add(item['descriptors'])
+                        
+                        filename = f"{item['visual_id']}.jpg"
+                        blob = self.state.bucket.blob(f"images/{filename}")
+                        blob.upload_from_string(item['image_bytes'], content_type='image/jpeg')
+                        
+                        cache.append({
+                            'id': item['visual_id'],
+                            'title': str(item['title']),
+                            'artist': str(item['artist']),
+                            'url': item['url'],
+                            'start_row': start_row,
+                            'end_row': master_index.ntotal - 1
+                            
+                        })
+                pbar.update(len(accumulator))
+
         if cache:
             vault_checkpoint(self.state, cache, master_index)
             print(f"\n💾 Flushing final checkpoint slice to GCS. Index length: {master_index.ntotal:,}")
-
-        # Gracefully shut down background thread resources
-        executor.shutdown(wait=True)
-        print("🏁 Concurrent thread pools decommissioned safely.")
+        
+        print("🏁 Parallel execution pool closed down safely.")
