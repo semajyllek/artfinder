@@ -1,19 +1,28 @@
-# ArtFinder: High-Fidelity Artwork Identification
+# ArtFinder: Image-First Visual Search Engine
 
-A computer vision pipeline for identifying artwork using **ORB features** and **FAISS IVF** indexing. This project utilizes pedagogical heuristics to optimize retrieval from large-scale museum datasets.
+ArtFinder is a high-performance visual search and identification engine built on top of OpenCV ORB feature descriptors and FAISS binary inverted file (IVF) clustering. The platform scales gracefully up to a 50,000-image footprint by organizing millions of local visual keypoints into distinct searchable neighborhoods.
 
-## Repository Structure
-- `artfinder/config.py`: Global hyperparameters (ORB, FAISS, and GCS paths).
-- `artfinder/engine.py`: Initialization, GCS authentication, and artist curation logic.
-- `artfinder/ingestor.py`: Ingestion logic, feature extraction, and vault management.
-- `artfinder/evaluator.py`: Retrieval evaluation, weighted voting, and RANSAC verification.
+## 🏗️ Architecture Pivot: Image-First
 
-## Core Goals
-1. **Curated Ingestion**: Filter sources (MoMA, AIC) using a curated artist authority list.
-2. **Optimized Search**: Maintain a dataset size of 30k–50k images for sub-200ms latency.
-3. **High Accuracy**: Utilize weighted voting based on keypoint distance to achieve ~98-100% accuracy.
+Historically, the system utilized a *Scraped-Data-First* architecture, which generated high network IO overhead by querying remote museum APIs (The Met, MoMA) sequentially to look up image links before performing feature extractions.
 
-## Getting Started
-1. Install dependencies: `pip install -r requirements.txt`.
-2. Run the Smoke Test notebook to verify GCS and MoMA connectivity.
-3. Use `run_sync_cycle()` to add new artworks and `build_search_indices()` to train the IVF index.
+The system now runs an optimized **Image-First Pipeline**:
+1. **Foundational Ingestion**: The system streams high-resolution matrices directly from local or curated image repositories (e.g., WikiArt).
+2. **Visual Feature Vaulting**: Visual features are extracted instantly via an immutable CV2 ORB matrix filter and appended to a flat master binary vault (`vector_vault.bin`).
+3. **Partitioned Centroid Clustering**: A K-Means calculation compiles the flat vectors into 4,096 distinct Voronoi cells to accelerate performance.
+4. **Secondary Lookup Enrichment**: Museum APIs are treated as non-blocking downstream consumers. Incoming pieces of art from museum catalogs are reconciled against the existing visual database via token-based fuzzy text matching on `Title` and `Artist` strings rather than downloading duplicate images.
+
+## 📦 Directory Structure
+
+```text
+artfinder/
+├── config.py           # Global hyperparameters (500 features, 4096 clusters, 256 dimensions)
+├── engine.py           # IVF training controllers and state initializations
+├── ingestor.py         # Abstract base tracking and data-recovery interfaces
+├── evaluator.py        # Math velocity validations and 3-way visual rendering engines
+├── intake/
+│   ├── wikiart.py      # Core stream parser translating category IDs to string names
+│   ├── met.py          # Downstream Met metadata alignment engine
+│   └── moma.py         # Downstream MoMA metadata alignment engine
+└── vault/
+    └── builder.py      # Unified checkpoint stream router and storage purgers

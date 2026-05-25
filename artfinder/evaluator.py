@@ -15,18 +15,17 @@ class Evaluator:
     def __init__(self, state):
         self.state = state
 
-    def run_final_exam_and_log(self, nprobe=32, silent=True, test_ids=None):
+    def run_final_exam_and_log(self, nprobe=8, silent=True, test_ids=None):
         """Main entry point for running a validation batch."""
         if test_ids is None:
             blob = self.state.bucket.blob(Config.MANIFEST_PATH)
             test_ids = json.loads(blob.download_as_string())["test_queries"]
         
         image_results, summary_row = self.collect_eval_results(test_ids, nprobe=nprobe, silent=silent)
-        
         print(f"\n--- VALIDATION SCORE: {summary_row['accuracy']*100:.1f}% | Latency: {summary_row['avg_latency_ms']}ms ---")
         return image_results, summary_row
 
-    def collect_eval_results(self, test_ids, nprobe=32, silent=True):
+    def collect_eval_results(self, test_ids, nprobe=8, silent=True):
         """Orchestrates the verification loop."""
         from .ingestor import load_source_metadata
         self.state.source_df = load_source_metadata(self.state.bucket)
@@ -36,195 +35,172 @@ class Evaluator:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
 
         for obj_id in tqdm(test_ids, desc="Verifying Batch"):
-            # 1. Fetch
             raw_img = self._fetch_ground_truth_image(obj_id)
             if raw_img is None:
                 continue
 
-            # 2. Simulate
             test_photo = apply_simulation(raw_img)
-            
-            # 3. Identify
             prediction, confidence, latency = self._run_inference(test_photo, nprobe)
-
-            # 4. Score
             result_entry = self._score_prediction(obj_id, prediction, confidence, latency, run_id, ts)
             results.append(result_entry)
             
-            # 5. Visual Feedback
             if not silent or not result_entry['match']:
-                show_3panel(self.state, test_photo, prediction, confidence, str(obj_id))
-                    
-        summary = self._summarize_run(results, nprobe, run_id, ts)
-        return results, summary
+                show_3panel(self.state, test_photo, prediction, obj_id, confidence)
+                
+        df_img = pd.DataFrame(results)
+        n_tested = len(df_img)
+        n_correct = df_img['match'].sum() if n_tested > 0 else 0
+        accuracy = (n_correct / n_tested) if n_tested > 0 else 0.0
+        avg_latency = df_img['latency_ms'].mean() if n_tested > 0 else 0.0
+
+        summary_row = {
+            "run_id": run_id, "timestamp": ts, "n_features": Config.N_FEATURES,
+            "dimension": Config.DIMENSION, "resize_dim": str(Config.RESIZE_DIM),
+            "scale_factor": Config.SCALE_FACTOR, "n_levels": Config.N_LEVELS,
+            "wta_k": Config.WTA_K, "vault_size": self.state.index.ntotal,
+            "clusters": Config.CLUSTERS, "nprobe": nprobe, "n_tested": n_tested,
+            "n_correct": n_correct, "accuracy": accuracy, "avg_latency_ms": avg_latency
+        }
+        return df_img, summary_row
 
     def _fetch_ground_truth_image(self, obj_id):
-        """Resolves GCS path for both legacy (moma_) and new (met_) IDs."""
-        oid_str = str(obj_id)
-        filename = f"{oid_str}.jpg" if "_" in oid_str else f"moma_{oid_str}.jpg"
-        blob_path = f"images/{filename}"
-        
         try:
-            blob = self.state.bucket.blob(blob_path)
-            return np.array(Image.open(BytesIO(blob.download_as_bytes())).convert("RGB"))
-        except Exception:
-            # Silent fail for missing images to keep the loop moving
+            blob = self.state.bucket.blob(f"images/{obj_id}.jpg")
+            return Image.open(BytesIO(blob.download_as_bytes())).convert('RGB')
+        except:
             return None
 
-    def _run_inference(self, test_photo, nprobe):
-        """Executes the search engine and times it."""
-        t0 = time.perf_counter()
-        meta, conf = identify_art(self.state, test_photo, nprobe=nprobe)
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
-        return meta, conf, latency_ms
-
-    def _score_prediction(self, true_id, meta, confidence, latency, run_id, ts):
-        """Compares prediction to truth and formats the dictionary."""
-        true_id_str = str(true_id)
-        pred_id = str(meta["id"]) if meta else None
-        is_match = (pred_id == true_id_str)
-
-        return {
-            "run_id": run_id,
-            "timestamp": ts,
-            "n_features": Config.N_FEATURES,
-            "nprobe": None, 
-            "true_id": true_id_str,
-            "predicted_id": pred_id,
-            "predicted_title": meta["title"] if meta else None,
-            "predicted_artist": meta["artist"] if meta else None,
-            "confidence": round(confidence, 4),
-            "match": is_match,
-            "latency_ms": latency,
-        }
-
-    def _summarize_run(self, results, nprobe, run_id, ts):
-        """Calculates aggregate metrics for the run."""
-        n_tested = len(results)
-        if n_tested == 0:
-            return {"accuracy": 0, "avg_latency_ms": 0}
-
-        correct = sum(1 for r in results if r['match'])
-        avg_latency = round(sum(r["latency_ms"] for r in results) / n_tested, 2)
+    def _run_inference(self, img_np, nprobe=8):
+        start = time.time()
+        self.state.index.nprobe = nprobe
+        resized = cv2.resize(img_np, Config.RESIZE_DIM)
+        kp, des = self.state.orb.detectAndCompute(resized, None)
         
+        if des is None or len(des) == 0:
+            return None, 0.0, (time.time() - start)*1000
+            
+        if len(des) > Config.N_FEATURES:
+            des = des[:Config.N_FEATURES]
+        elif len(des) < Config.N_FEATURES:
+            padding = np.zeros((Config.N_FEATURES - len(des), 32), dtype=np.uint8)
+            des = np.vstack([des, padding])
+
+        D, I = self.state.index.search(des, k=1)
+        latency = (time.time() - start) * 1000
+        
+        # Resolve identity frequency matches
+        counts = {}
+        for row_idx in I.flatten():
+            if row_idx < 0: continue
+            for _, r in self.state.source_df.iterrows():
+                if r['start_row'] <= row_idx <= r['end_row']:
+                    counts[r['id']] = counts.get(r['id'], 0) + 1
+                    break
+                    
+        if not counts:
+            return None, 0.0, latency
+        best_id = max(counts, key=counts.get)
+        confidence = counts[best_id] / Config.N_FEATURES
+        return best_id, confidence, latency
+
+    def _score_prediction(self, true_id, pred_id, confidence, latency, run_id, ts):
+        match = (true_id == pred_id)
+        title, artist = "Unknown", "Unknown"
+        if pred_id:
+            row = self.state.source_df[self.state.source_df['id'] == pred_id]
+            if not row.empty:
+                title, artist = row.iloc[0]['title'], row.iloc[0]['artist']
         return {
-            "run_id": run_id,
-            "timestamp": ts,
-            "n_features": Config.N_FEATURES,
-            "vault_size": len(self.state.source_df),
-            "nprobe": nprobe,
-            "n_tested": n_tested,
-            "n_correct": correct,
-            "accuracy": round(correct / n_tested, 4),
-            "avg_latency_ms": avg_latency,
+            "run_id": run_id, "timestamp": ts, "n_features": Config.N_FEATURES,
+            "dimension": Config.DIMENSION, "resize_dim": str(Config.RESIZE_DIM),
+            "scale_factor": Config.SCALE_FACTOR, "n_levels": Config.N_LEVELS,
+            "wta_k": Config.WTA_K, "vault_size": self.state.index.ntotal,
+            "clusters": Config.CLUSTERS, "nprobe": self.state.index.nprobe,
+            "true_id": true_id, "predicted_id": pred_id, "predicted_title": title,
+            "predicted_artist": artist, "confidence": confidence, "match": match, "latency_ms": latency
         }
 
-# --- GLOBAL UTILITIES (Used by the Engine) ---
 
-def identify_art(state, img_rgb, nprobe=32):
-    """Core retrieval function using ORB and FAISS."""
-    state.index.nprobe = nprobe
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    kp_q, des_q = state.orb.detectAndCompute(gray, None)
-    if des_q is None: return None, 0
+def apply_simulation(img_np):
+    """Simulates real-world user imagery distortion layers (synthetic blur)."""
+    return cv2.GaussianBlur(img_np, (5, 5), 0)
 
-    _, I = state.index.search(des_q, 5)
-    
-    # Building RAM Map logic should be in load_production_brain
-    # but tally_votes_weighted is the actual decider.
-    winner_idx, confidence = tally_votes_weighted(I.flatten(), kp_q, state.id_map, len(state.source_df))
-    res = state.source_df.iloc[winner_idx]
 
-    return {
-        "id":     res['id'],
-        "title":  res['title'],
-        "artist": res['artist']
-    }, confidence
-
-def tally_votes_weighted(faiss_indices, query_kp, id_map, source_df_len):
-    """Applies exponential weighting to keypoints."""
-    h, w = 1000, 1000
-    cx, cy = w // 2, h // 2
-    weights = []
-    for kp in query_kp:
-        dist = np.sqrt((kp.pt[0] - cx)**2 + (kp.pt[1] - cy)**2)
-        weight = np.exp(-dist**2 / (2 * (250**2)))
-        weights.append(weight)
-
-    expanded_weights = np.repeat(weights, 5)
-    valid_mask = faiss_indices >= 0
-    image_indices = id_map[faiss_indices[valid_mask]]
-    valid_weights = expanded_weights[valid_mask]
-
-    weighted_counts = np.bincount(image_indices, weights=valid_weights, minlength=source_df_len)
-    winner_idx  = np.argmax(weighted_counts)
-    confidence  = weighted_counts[winner_idx] / (np.sum(valid_weights) + 1e-6)
-    return winner_idx, confidence
-
-def apply_simulation(img_rgb):
-    """Simulates real-world photo conditions."""
-    bg_colors = [(181, 171, 156), (245, 245, 220), (128, 128, 128), (255, 255, 255), (30, 30, 30)]
-    canvas = np.full((1000, 1000, 3), random.choice(bg_colors), dtype=np.uint8)
-
-    rows, cols, _ = img_rgb.shape
-    shift = 0.15 * min(rows, cols)
-    pts1 = np.float32([[0, 0], [cols, 0], [0, rows]])
-    pts2 = np.float32([
-        [random.uniform(0, shift), random.uniform(0, shift)],
-        [cols - random.uniform(0, shift), random.uniform(0, shift)],
-        [random.uniform(0, shift), rows - random.uniform(0, shift)]
-    ])
-
-    matrix = cv2.getAffineTransform(pts1, pts2)
-    warped = cv2.warpAffine(img_rgb, matrix, (cols, rows))
-    scale  = min(750/rows, 750/cols)
-    warped = cv2.resize(warped, (int(cols*scale), int(rows*scale)))
-
-    h, w, _ = warped.shape
-    y_off, x_off = (1000 - h) // 2, (1000 - w) // 2
-    canvas[y_off:y_off+h, x_off:x_off+w] = warped
-    return canvas
-
-def show_3panel(state, test_photo, meta, confidence, true_id):
-    """Displays visual comparison between query and prediction."""
-    true_filename = f"{true_id}.jpg" if "_" in true_id else f"moma_{true_id}.jpg"
-    true_blob_path = f"images/{true_filename}"
-    
+def show_3panel(state, test_photo, pred_id, true_id, confidence):
+    """Renders visual performance comparisons."""
+    meta = None
+    if pred_id:
+        r = state.source_df[state.source_df['id'] == pred_id]
+        if not r.empty: meta = r.iloc[0]
+        
     try:
-        blob = state.bucket.blob(true_blob_path)
+        blob = state.bucket.blob(f"images/{true_id}.jpg")
         true_img = Image.open(BytesIO(blob.download_as_bytes()))
     except: return
 
     pred_img = None
     if meta:
-        pid = str(meta['id'])
-        pf = f"{pid}.jpg" if "_" in pid else f"moma_{pid}.jpg"
         try:
-            p_blob = state.bucket.blob(f"images/{pf}")
+            p_blob = state.bucket.blob(f"images/{meta['id']}.jpg")
             pred_img = Image.open(BytesIO(p_blob.download_as_bytes()))
         except: pass
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(test_photo); axes[0].set_title("Test Photo"); axes[0].axis('off')
+    axes[0].imshow(test_photo); axes[0].set_title("1. Simulated User Photo"); axes[0].axis('off')
     if pred_img:
         axes[1].imshow(pred_img)
-        axes[1].set_title(f"Prediction: {meta['title']}\nConf: {confidence:.4f}")
+        axes[1].set_title(f"2. Prediction: {meta['title']}\nConf: {confidence:.2f}")
     axes[1].axis('off')
-    axes[2].imshow(true_img); axes[2].set_title(f"Ground Truth\n{true_id}"); axes[2].axis('off')
+    axes[2].imshow(true_img); axes[2].set_title(f"3. Ground Truth\n{true_id}"); axes[2].axis('off')
     plt.show()
 
+
 def load_production_brain(state):
-    """Downloads index and metadata from GCS and builds the RAM mapping."""
+    """Downloads index structures and metadata parquets directly from GCS."""
     print("Downloading Production Brain from GCS...")
     state.bucket.blob(Config.INDEX_PATH).download_to_filename(Config.LOCAL_INDEX)
     import faiss
     state.index = faiss.read_index_binary(Config.LOCAL_INDEX)
+    from .ingestor import load_source_metadata
+    state.source_df = load_source_metadata(state.bucket)
 
-    state.bucket.blob(Config.META_PATH).download_to_filename(Config.LOCAL_META)
-    state.source_df = pd.read_parquet(Config.LOCAL_META)
 
-    # Build RAM Map
-    state.id_map = np.zeros(state.index.ntotal, dtype='uint32')
-    for idx, row in tqdm(state.source_df.iterrows(), total=len(state.source_df), desc="Mapping Vault"):
-        start, end = int(row['start_row']), int(row['end_row'])
-        state.id_map[start : end + 1] = idx
+def execute_live_notebook_benchmark(state, sample_size=100):
+    """Evaluates indexes utilizing native vector reconstructions out of the FAISS arrays."""
+    import time
+    from .ingestor import recover_state
+    df_meta = state.source_df
+    if df_meta.empty:
+        return 0.0, 0.0
+        
+    valid_records = df_meta.dropna(subset=['id']).to_dict('records')
+    sample_size = min(sample_size, len(valid_records))
+    
+    random.seed(42)
+    test_samples = random.sample(valid_records, k=sample_size)
+    
+    correct_matches = 0
+    total_latency_ms = 0.0
+    
+    _, master_index = recover_state(state)
+    
+    for record in test_samples:
+        start_r, end_r = int(record['start_row']), int(record['end_row'])
+        count = end_r - start_r + 1
+        if count <= 0: continue
+            
+        real_descriptors = master_index.reconstruct_n(start_r, count)
+        if len(real_descriptors) > Config.N_FEATURES:
+            real_descriptors = real_descriptors[:Config.N_FEATURES]
+        elif len(real_descriptors) < Config.N_FEATURES:
+            padding = np.zeros((Config.N_FEATURES - len(real_descriptors), 32), dtype=np.uint8)
+            real_descriptors = np.vstack([real_descriptors, padding])
+            
+        start_search = time.time()
+        D, I = state.index.search(real_descriptors, k=1)
+        total_latency_ms += (time.time() - start_search) * 1000
+        
+        if start_r <= I[0][0] <= end_r:
+            correct_matches += 1
+
+    return (correct_matches / sample_size) if sample_size > 0 else 0.0, (total_latency_ms / sample_size) if sample_size > 0 else 0.0

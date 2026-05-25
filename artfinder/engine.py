@@ -1,4 +1,6 @@
+# artfinder/engine.py
 import cv2
+import os
 import pandas as pd
 import re
 import csv
@@ -11,7 +13,6 @@ from .config import Config
 import faiss
 import numpy as np
 
-
 @dataclass
 class SearchEngineState:
     client:        storage.Client
@@ -23,44 +24,24 @@ class SearchEngineState:
     source_df: object = None
     id_map:    object = None
 
-
-
 def build_search_indices(state):
-    """
-    Performs K-means clustering on vaulted vectors to create an IVF index.
-    Essential for scaling toward the 50,000 image limit.
-    """
-    # 1. Recover the raw vectors from the vault
+    """Performs K-means clustering on vaulted vectors to create an IVF index."""
     from .ingestor import recover_state
     _, master_index = recover_state(state)
-    
-    # Extract the underlying data as a numpy array
-    # IndexBinaryFlat stores data in a way that allows reconstruction
     n_total = master_index.ntotal
     print(f"Reconstructing {n_total:,} vectors for training...")
-    
-    # Get all vectors (MoMA + Met)
     all_vectors = master_index.reconstruct_n(0, n_total)
     
-    # 2. Configure the IVF Index
-    # We use 4096 centroids to maintain high speed as we hit 50k images
     quantizer = faiss.IndexBinaryFlat(Config.DIMENSION)
-    index_ivf = faiss.IndexBinaryIVF(quantizer, Config.DIMENSION, 4096)
+    index_ivf = faiss.IndexBinaryIVF(quantizer, Config.DIMENSION, Config.CLUSTERS)
     
-    # 3. Train the Index
-    # This is the 'Brain Training'—it groups similar visual features together
-    print(f"Training IVF Index with 4096 centroids...")
+    print(f"Training IVF Index with {Config.CLUSTERS} centroids...")
     index_ivf.train(all_vectors)
-    
-    # 4. Add the vectors to the new structure
-    print("Populating IVF Index...")
     index_ivf.add(all_vectors)
     
-    # 5. Save locally
     faiss.write_index_binary(index_ivf, Config.LOCAL_INDEX)
     state.index = index_ivf
     print(f"✅ Search Index rebuilt successfully with {index_ivf.ntotal:,} vectors.")
-
 
 def setup_gcs():
     auth.authenticate_user()
@@ -78,39 +59,6 @@ def build_authority_set():
         lines = [line.decode('utf-8') for line in response.readlines()]
     return {row['artist'].lower().strip() for row in csv.DictReader(lines)}
 
-
-def is_curated_artist(name, authority_set):
-    """
-    Determines if an artist exists in the curated set using 
-    cleaning and fuzzy matching.
-    """
-    if not name or str(name).lower() in ['unknown', 'unidentified artist', '']:
-        return False
-    
-    # 1. CLEANING: Lowercase and strip parenthetical "noise" (dates, locations)
-    # This turns "Rembrandt (Rembrandt van Rijn)" -> "rembrandt"
-    clean_name = str(name).lower()
-    clean_name = re.sub(r'\(.*\)', '', clean_name).strip()
-    
-    # 2. EXACT MATCH: Fast check against the authority set
-    if clean_name in authority_set:
-        return True
-        
-    # 3. FUZZY MATCH: Token-based comparison to handle name order
-    # token_set_ratio handles "Sargent, John" vs "John Sargent" perfectly
-    # We use a threshold of 90 to maintain precision.
-    for curated_name in authority_set:
-        # Avoid checking very short strings to prevent false positives
-        if len(clean_name) < 4: continue 
-        
-        ratio = fuzz.token_set_ratio(clean_name, curated_name)
-        if ratio >= 90:
-            return True
-            
-    return False
-
-
-
 def initialize_engine():
     client, bucket = setup_gcs()
     df_moma   = load_moma_universe()
@@ -122,3 +70,58 @@ def initialize_engine():
                     WTA_K       = Config.WTA_K,
                 )
     return SearchEngineState(client, bucket, df_moma, auth_set, orb)
+
+
+def run_complete_system_rebuild(state):
+    """Orchestrates the entire image-first rebuild pipeline entirely within functions."""
+    import time
+    from datasets import load_dataset
+    from .vault.builder import VaultBuilder, purge_local_cache_files, purge_gcs_production_vault
+    from .intake.wikiart import wikiart_image_first_generator
+    from .evaluator import load_production_brain, execute_live_notebook_benchmark
+
+    start_wall_time = time.time()
+    print("🚧 --- STARTING TOTAL ENGINE RECONSTRUCTION --- 🚧\n")
+    
+    purge_local_cache_files()
+    purge_gcs_production_vault(state)
+    
+    print("\n📦 Opening Hugging Face WikiArt Dataset stream layers...")
+    wikiart_stream = load_dataset("huggan/wikiart", split="train", streaming=True)
+    artist_labels = wikiart_stream.features['artist'].names
+    
+    curated_stream = wikiart_image_first_generator(
+        stream=wikiart_stream,
+        labels=artist_labels,
+        authority_set=state.authority_set
+    )
+    
+    print(f"🚀 Extracting ORB features for {len(state.authority_set)} target artists...")
+    builder = VaultBuilder(state)
+    builder.ingest_stream(data_stream=curated_stream, batch_name="wikiart_foundational_layer")
+    
+    build_search_indices(state)
+    
+    print(f"📤 Uploading local '{Config.LOCAL_INDEX}' to GCS destination '{Config.INDEX_PATH}'...")
+    if os.path.exists(Config.LOCAL_INDEX):
+        blob = state.bucket.blob(Config.INDEX_PATH)
+        blob.upload_from_filename(Config.LOCAL_INDEX)
+        print("  ✅ IVF production index uploaded successfully!")
+    else:
+        raise FileNotFoundError(f"❌ Expected local index file at '{Config.LOCAL_INDEX}' is missing.")
+    
+    print("\n🧠 Activating new production brain pointers...")
+    load_production_brain(state)
+    state.index.nprobe = 8
+    
+    print("\n📈 Executing verification benchmark across clean asset maps...")
+    accuracy, latency = execute_live_notebook_benchmark(state, sample_size=100)
+    
+    print("\n🏆 --- TARGET PIPELINE REALIZED --- 🏆")
+    print(f"Total Unique Artworks Vaulted: {len(state.source_df):,}")
+    print(f"Active Features Tracked:      {state.index.ntotal:,}")
+    print(f"Benchmark Match Accuracy:     {accuracy * 100:.2f}%")
+    print(f"Verified Engine Latency:      {latency:.2f} ms")
+        
+    duration = time.time() - start_wall_time
+    print(f"\n✨ Total Pipeline Execution Completed in: {duration/60:.2f} minutes.")
