@@ -72,37 +72,93 @@ class Evaluator:
         except:
             return None
 
+
+
+    def _standardize_descriptor_shape(self, des):
+        """
+        Ensures the incoming descriptor matrix strictly matches the exact 
+        fixed feature layout boundaries required by the FAISS matrix index.
+        """
+        if des is None or len(des) == 0:
+            return np.zeros((Config.N_FEATURES, 32), dtype=np.uint8)
+            
+        if len(des) > Config.N_FEATURES:
+            return des[:Config.N_FEATURES]
+        elif len(des) < Config.N_FEATURES:
+            padding = np.zeros((Config.N_FEATURES - len(des), 32), dtype=np.uint8)
+            return np.vstack([des, padding])
+        return des
+
+
+    def _execute_faiss_batch_search(self, des, nprobe):
+        """
+        Locks down cluster pruning limits and passes descriptors as a unified 
+        parallel C++ batch array block directly to the FAISS index.
+        """
+        if hasattr(self.state.index, 'nprobe'):
+            self.state.index.nprobe = nprobe
+            
+        # des is shape (500, 32). C++ layer searches all 500 vectors simultaneously
+        D, I = self.state.index.search(des, k=1)
+        return D, I
+
+
+    def _tally_identity_votes(self, index_matrix):
+        """
+        Scans through the returned parallel nearest-neighbor row matches and 
+        tallies identity frequencies across metadata parquet block boundaries.
+        """
+        counts = {}
+        for row_idx in index_matrix.flatten():
+            if row_idx < 0: 
+                continue
+                
+            for _, row_record in self.state.source_df.iterrows():
+                start_r = int(row_record['start_row'])
+                end_r = int(row_record['end_row'])
+                
+                if start_r <= row_idx <= end_r:
+                    artwork_id = row_record['id']
+                    counts[artwork_id] = counts.get(artwork_id, 0) + 1
+                    break
+        return counts
+
+
+    def _resolve_top_prediction(self, identity_votes):
+        """
+        Evaluates voting frequencies to select the maximum confidence target identity.
+        """
+        if not identity_votes:
+            return None, 0.0
+            
+        best_id = max(identity_votes, key=identity_votes.get)
+        confidence = identity_votes[best_id] / Config.N_FEATURES
+        return best_id, confidence
+
+
     def _run_inference(self, img_np, nprobe=8):
-        start = time.time()
-        self.state.index.nprobe = nprobe
+        """
+        Main orchestration gateway for processing high-speed inference passes.
+        """
+        start_time = time.time()
+        
+        # 1. Image Keypoint Detection
         resized = cv2.resize(img_np, Config.RESIZE_DIM)
         kp, des = self.state.orb.detectAndCompute(resized, None)
         
-        if des is None or len(des) == 0:
-            return None, 0.0, (time.time() - start)*1000
-            
-        if len(des) > Config.N_FEATURES:
-            des = des[:Config.N_FEATURES]
-        elif len(des) < Config.N_FEATURES:
-            padding = np.zeros((Config.N_FEATURES - len(des), 32), dtype=np.uint8)
-            des = np.vstack([des, padding])
-
-        D, I = self.state.index.search(des, k=1)
-        latency = (time.time() - start) * 1000
+        # 2. Vector Matrix Alignment
+        standardized_des = self._standardize_descriptor_shape(des)
         
-        counts = {}
-        for row_idx in I.flatten():
-            if row_idx < 0: continue
-            for _, r in self.state.source_df.iterrows():
-                if r['start_row'] <= row_idx <= r['end_row']:
-                    counts[r['id']] = counts.get(r['id'], 0) + 1
-                    break
-                    
-        if not counts:
-            return None, 0.0, latency
-        best_id = max(counts, key=counts.get)
-        confidence = counts[best_id] / Config.N_FEATURES
-        return best_id, confidence, latency
+        # 3. Parallel C++ Core Cluster Index Lookup
+        D, I = self.state.execute_faiss_batch_search(standardized_des, nprobe)
+        latency_ms = (time.time() - start_time) * 1000
+        
+        # 4. Identity Mapping & Confidence Sorting
+        votes = self._tally_identity_votes(I)
+        predicted_id, confidence = self._resolve_top_prediction(votes)
+        
+        return predicted_id, confidence, latency_ms
+
 
     def _score_prediction(self, true_id, pred_id, confidence, latency, run_id, ts):
         match = (true_id == pred_id)
