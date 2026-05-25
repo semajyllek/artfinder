@@ -1,4 +1,3 @@
-# artfinder/engine.py
 import cv2
 import os
 import pandas as pd
@@ -8,25 +7,22 @@ import urllib.request
 from dataclasses import dataclass
 from google.cloud import storage
 from google.colab import auth
-from fuzzywuzzy import fuzz
-from .config import Config
 import faiss
 import numpy as np
+from .config import Config
 
 @dataclass
 class SearchEngineState:
     client:        storage.Client
     bucket:        storage.Bucket
-    df_moma:       pd.DataFrame
     authority_set: set
     orb:           cv2.Feature2D
     index:     object = None
     source_df: object = None
-    id_map:    object = None
 
 def build_search_indices(state):
     """Performs K-means clustering on vaulted vectors to create an IVF index."""
-    from .ingestor import recover_state
+    from .vault.builder import recover_state
     _, master_index = recover_state(state)
     n_total = master_index.ntotal
     print(f"Reconstructing {n_total:,} vectors for training...")
@@ -49,10 +45,6 @@ def setup_gcs():
     bucket = client.get_bucket(Config.BUCKET_NAME)
     return client, bucket
 
-def load_moma_universe():
-    MOMA_URL = "https://github.com/MuseumofModernArt/collection/raw/main/Artworks.csv?download=true"
-    return pd.read_csv(MOMA_URL, low_memory=False, on_bad_lines='skip')
-
 def build_authority_set():
     AUTH_URL = "https://raw.githubusercontent.com/oobabooga/stable-diffusion-automatic/master/artists.csv"
     with urllib.request.urlopen(AUTH_URL) as response:
@@ -61,7 +53,6 @@ def build_authority_set():
 
 def initialize_engine():
     client, bucket = setup_gcs()
-    df_moma   = load_moma_universe()
     auth_set  = build_authority_set()
     orb       = cv2.ORB_create(
                     nfeatures   = Config.N_FEATURES,
@@ -69,7 +60,7 @@ def initialize_engine():
                     nlevels     = Config.N_LEVELS,
                     WTA_K       = Config.WTA_K,
                 )
-    return SearchEngineState(client, bucket, df_moma, auth_set, orb)
+    return SearchEngineState(client, bucket, auth_set, orb)
 
 
 def run_complete_system_rebuild(state):

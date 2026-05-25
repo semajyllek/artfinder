@@ -1,14 +1,97 @@
 # artfinder/vault/builder.py
 import os
 import gc
-import urllib.request
+import cv2
+import faiss
 import numpy as np
 import pandas as pd
 from io import BytesIO
 from PIL import Image
 from tqdm.auto import tqdm
 from ..config import Config
-from ..ingestor import recover_state, vault_checkpoint, load_source_metadata
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CORE CHECKPOINT & METADATA UTILITIES (Absorbed from old ingestor.py)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_source_metadata(bucket):
+    """Downloads the production metadata parquet index from GCS."""
+    blob = bucket.blob(Config.META_PATH)
+    if blob.exists():
+        content = blob.download_as_bytes()
+        return pd.read_parquet(BytesIO(content))
+    return pd.DataFrame(columns=['id', 'title', 'artist', 'url', 'start_row', 'end_row'])
+
+
+def recover_state(state):
+    """Recovers source metadata and the unclustered binary vector vault from GCS."""
+    source_df = load_source_metadata(state.bucket)
+    blob = state.bucket.blob(Config.VAULT_PATH)
+    
+    if blob.exists():
+        blob.download_to_filename(Config.LOCAL_VAULT)
+        master_index = faiss.read_index_binary(Config.LOCAL_VAULT)
+    else:
+        master_index = faiss.IndexBinaryFlat(Config.DIMENSION)
+        
+    state.source_df = source_df
+    state.index = master_index
+    return source_df, master_index
+
+
+def vault_checkpoint(state, new_records, master_index):
+    """Saves unclustered database progress to GCS to prevent data loss during long syncs."""
+    if not new_records: 
+        return
+        
+    current_source = load_source_metadata(state.bucket)
+    updated_source = pd.concat([current_source, pd.DataFrame(new_records)], ignore_index=True)
+
+    # Save metadata parquet upstream
+    updated_source.to_parquet(Config.LOCAL_META, index=False)
+    state.bucket.blob(Config.META_PATH).upload_from_filename(Config.LOCAL_META)
+
+    # Save flat binary vault upstream
+    faiss.write_index_binary(master_index, Config.LOCAL_VAULT)
+    state.bucket.blob(Config.VAULT_PATH).upload_from_filename(Config.LOCAL_VAULT)
+    
+    state.source_df = updated_source
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WORKSPACE PURGE UTILITIES
+# ──────────────────────────────────────────────────────────────────────────────
+
+def purge_local_cache_files():
+    """Removes leftover configuration and cache artifacts from local storage."""
+    print("🧹 Purging local system cache tracks...")
+    local_targets = [Config.LOCAL_META, Config.LOCAL_VAULT, Config.LOCAL_INDEX]
+    for filename in local_targets:
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+                print(f"  Deleted local track: {filename}")
+            except OSError as e:
+                print(f"  ⚠️ Could not clear local file {filename}: {e}")
+
+
+def purge_gcs_production_vault(state):
+    """Deletes existing binary vaults and parquets inside the active cloud bucket."""
+    print("🗑️ Erasing historical engine assets from Google Cloud Storage...")
+    gcs_targets = [Config.META_PATH, Config.VAULT_PATH, Config.INDEX_PATH]
+    for gcs_path in gcs_targets:
+        blob = state.bucket.blob(gcs_path)
+        if blob.exists():
+            try:
+                blob.delete()
+                print(f"  Deleted from GCS Bucket: {gcs_path}")
+            except Exception as e:
+                print(f"  ⚠️ GCS deletion failure on path {gcs_path}: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# INGESTION BUILDER ENGINE
+# ──────────────────────────────────────────────────────────────────────────────
 
 class VaultBuilder:
     """
@@ -40,14 +123,12 @@ class VaultBuilder:
                 continue
 
             try:
-                # Direct feature extraction out of the stream's raw PIL image layer
                 pil_img = record['image']
                 if isinstance(pil_img, Image.Image):
                     img_np = np.array(pil_img.convert('RGB'))
                 else:
                     continue
 
-                # Quantize sizing barriers
                 resized = cv2.resize(img_np, Config.RESIZE_DIM)
                 kp, des = self.state.orb.detectAndCompute(resized, None)
 
@@ -86,30 +167,3 @@ class VaultBuilder:
         if cache:
             vault_checkpoint(self.state, cache, master_index)
             print(f"\n💾 Flushing final checkpoint slice to GCS. Index length: {master_index.ntotal:,}")
-
-
-def purge_local_cache_files():
-    """Removes leftover configuration and cache artifacts from local storage."""
-    print("🧹 Purging local system cache tracks...")
-    local_targets = [Config.LOCAL_META, Config.LOCAL_VAULT, Config.LOCAL_INDEX]
-    for filename in local_targets:
-        if os.path.exists(filename):
-            try:
-                os.remove(filename)
-                print(f"  Deleted local track: {filename}")
-            except OSError as e:
-                print(f"  ⚠️ Could not clear local file {filename}: {e}")
-
-
-def purge_gcs_production_vault(state):
-    """Deletes existing binary vaults and parquets inside the active cloud bucket."""
-    print("🗑️ Erasing historical engine assets from Google Cloud Storage...")
-    gcs_targets = [Config.META_PATH, Config.VAULT_PATH, Config.INDEX_PATH]
-    for gcs_path in gcs_targets:
-        blob = state.bucket.blob(gcs_path)
-        if blob.exists():
-            try:
-                blob.delete()
-                print(f"  Deleted from GCS Bucket: {gcs_path}")
-            except Exception as e:
-                print(f"  ⚠️ GCS deletion failure on path {gcs_path}: {e}")
