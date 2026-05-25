@@ -1,4 +1,3 @@
-# artfinder/vault/builder.py
 import os
 import gc
 import cv2
@@ -11,11 +10,14 @@ from tqdm.auto import tqdm
 from ..config import Config
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORE CHECKPOINT & METADATA UTILITIES (Absorbed from old ingestor.py)
+# 1. CORE PARQUET & RECOVERY UTILITIES
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_source_metadata(bucket):
-    """Downloads the production metadata parquet index from GCS."""
+    """
+    Downloads the active production metadata parquet index tracking sheet 
+    directly from the mounted GCS bucket locations.
+    """
     blob = bucket.blob(Config.META_PATH)
     if blob.exists():
         content = blob.download_as_bytes()
@@ -24,7 +26,10 @@ def load_source_metadata(bucket):
 
 
 def recover_state(state):
-    """Recovers source metadata and the unclustered binary vector vault from GCS."""
+    """
+    Synchronizes local environment blocks by reading down historical parquets 
+    and mounting unclustered flat binary vaults out of your GCS bucket.
+    """
     source_df = load_source_metadata(state.bucket)
     blob = state.bucket.blob(Config.VAULT_PATH)
     
@@ -32,6 +37,7 @@ def recover_state(state):
         blob.download_to_filename(Config.LOCAL_VAULT)
         master_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     else:
+        # Initialize an empty, flat uncompressed array if no cloud cache exists
         master_index = faiss.IndexBinaryFlat(Config.DIMENSION)
         
     state.source_df = source_df
@@ -40,18 +46,21 @@ def recover_state(state):
 
 
 def vault_checkpoint(state, new_records, master_index):
-    """Saves unclustered database progress to GCS to prevent data loss during long syncs."""
+    """
+    Performs safe transactional serialization passes upstream to GCS to safeguard 
+    extracted high-dimensional array states during heavy streaming routines.
+    """
     if not new_records: 
         return
         
     current_source = load_source_metadata(state.bucket)
     updated_source = pd.concat([current_source, pd.DataFrame(new_records)], ignore_index=True)
 
-    # Save metadata parquet upstream
+    # Serialize metadata updates to GCS
     updated_source.to_parquet(Config.LOCAL_META, index=False)
     state.bucket.blob(Config.META_PATH).upload_from_filename(Config.LOCAL_META)
 
-    # Save flat binary vault upstream
+    # Serialize raw flat binary descriptors to GCS
     faiss.write_index_binary(master_index, Config.LOCAL_VAULT)
     state.bucket.blob(Config.VAULT_PATH).upload_from_filename(Config.LOCAL_VAULT)
     
@@ -59,7 +68,7 @@ def vault_checkpoint(state, new_records, master_index):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# WORKSPACE PURGE UTILITIES
+# 2. RUNTIME WORKSPACE CLEANERS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def purge_local_cache_files():
@@ -90,7 +99,7 @@ def purge_gcs_production_vault(state):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# INGESTION BUILDER ENGINE
+# 3. UNIFIED INGESTION BUILDER ENGINE
 # ──────────────────────────────────────────────────────────────────────────────
 
 class VaultBuilder:
@@ -103,8 +112,8 @@ class VaultBuilder:
 
     def ingest_stream(self, data_stream, batch_name, total_records=None):
         """
-        The central, unified ingestion gateway. Expects an iterable stream of 
-        standardized dictionaries: {'visual_id', 'image', 'title', 'artist', 'filename'}
+        Unified ingestion gateway with explicit outer-loop telemetry tracking
+        to prevent tqdm progress bars from swallowing the dashboard output.
         """
         _, master_index = recover_state(self.state)
         
@@ -115,10 +124,22 @@ class VaultBuilder:
             known_ids = set()
 
         cache = []
+        
+        # Outer Loop Telemetry Real-time Trackers
+        total_scanned = 0
+        total_matched = 0
+        unique_artists = set()
+
         print(f"🚀 Initializing unified ingestion loop for batch: {batch_name}")
 
         for record in tqdm(data_stream, desc=f"Vaulting {batch_name}", total=total_records):
+            total_scanned += 1
             visual_id = record['visual_id']
+            
+            # Feed real-time uniqueness ledger trackers directly
+            if 'artist' in record:
+                unique_artists.add(record['artist'])
+
             if visual_id in known_ids:
                 continue
 
@@ -129,14 +150,16 @@ class VaultBuilder:
                 else:
                     continue
 
+                # Standardize spatial dimension sizes
                 resized = cv2.resize(img_np, Config.RESIZE_DIM)
                 kp, des = self.state.orb.detectAndCompute(resized, None)
 
                 if des is not None and len(des) > 0:
+                    total_matched += 1
                     start_row = master_index.ntotal
                     master_index.add(des)
 
-                    # Save the raw compressed JPEG matrix to GCS bucket for visual inspection loops
+                    # Compress and pipeline query image representations to cloud targets
                     buffer = BytesIO()
                     pil_img.convert('RGB').save(buffer, format="JPEG", quality=85)
                     content = buffer.getvalue()
@@ -153,6 +176,15 @@ class VaultBuilder:
                         'start_row': start_row,
                         'end_row': master_index.ntotal - 1
                     })
+
+                # Safely intercept outer line states to inject readable stream diagnostics
+                if total_scanned % 1000 == 0:
+                    print(f"\n✨ --- LIVE INGESTION DASHBOARD [Records Processed: {total_scanned:,}] --- ✨")
+                    print(f"  • Total Artworks Accepted: {total_matched:,}")
+                    print(f"  • Unique Artists Ingested: {len(unique_artists):,}")
+                    if unique_artists:
+                        print(f"  • Sample Active Artists:   {', '.join(list(unique_artists)[-5:])}")
+                    print("─" * 60)
 
                 if len(cache) >= Config.CHECKPOINT_SIZE:
                     vault_checkpoint(self.state, cache, master_index)
