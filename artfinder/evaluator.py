@@ -1,3 +1,4 @@
+# artfinder/evaluator.py
 import os
 import cv2
 import json
@@ -27,7 +28,8 @@ class Evaluator:
 
     def collect_eval_results(self, test_ids, nprobe=8, silent=True):
         """Orchestrates the verification loop."""
-        from .ingestor import load_source_metadata
+        # 🌟 FIXED: Points to the new consolidated vault builder location
+        from .vault.builder import load_source_metadata
         self.state.source_df = load_source_metadata(self.state.bucket)
         
         results = []
@@ -88,7 +90,6 @@ class Evaluator:
         D, I = self.state.index.search(des, k=1)
         latency = (time.time() - start) * 1000
         
-        # Resolve identity frequency matches
         counts = {}
         for row_idx in I.flatten():
             if row_idx < 0: continue
@@ -161,14 +162,17 @@ def load_production_brain(state):
     state.bucket.blob(Config.INDEX_PATH).download_to_filename(Config.LOCAL_INDEX)
     import faiss
     state.index = faiss.read_index_binary(Config.LOCAL_INDEX)
-    from .ingestor import load_source_metadata
+    
+    # 🌟 FIXED: Points to the new consolidated vault builder location
+    from .vault.builder import load_source_metadata
     state.source_df = load_source_metadata(state.bucket)
 
 
 def execute_live_notebook_benchmark(state, sample_size=100):
     """Evaluates indexes utilizing native vector reconstructions out of the FAISS arrays."""
     import time
-    from .ingestor import recover_state
+    # 🌟 FIXED: Points to the new consolidated vault builder location
+    from .vault.builder import recover_state
     df_meta = state.source_df
     if df_meta.empty:
         return 0.0, 0.0
