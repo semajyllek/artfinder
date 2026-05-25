@@ -2,12 +2,19 @@
 from .matcher import match_artist_signatures
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. TELEMETRY AND REPORTING UNIT
+# 1. ENRICHED TELEMETRY AND REPORTING UNIT
 # ──────────────────────────────────────────────────────────────────────────────
 
-def log_stream_heartbeat(scanned_count: int, matched_count: int):
-    """Prints a periodic diagnostic heartbeat log tracking parsing velocity."""
-    print(f"📊 Progress Check | Scanned: {scanned_count:,} | Successfully Matched: {matched_count:,}")
+def log_stream_heartbeat(scanned_count: int, matched_count: int, unique_artists: set):
+    """Prints a deep periodic diagnostic report detailing ingestion diversity metrics."""
+    print(f"\n✨ --- LIVE INGESTION DASHBOARD [Images Scanned: {scanned_count:,}] --- ✨")
+    print(f"  • Total Artworks Accepted: {matched_count:,}")
+    print(f"  • Unique Artists Ingested: {len(unique_artists):,}")
+    
+    # Show the last 5 unique artists added to give a sense of streaming drift
+    recent_additions = list(unique_artists)[-5:]
+    print(f"  • Recent Artists Onboarded: {', '.join(recent_additions)}")
+    print("─" * 60)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -45,7 +52,6 @@ def transform_to_standard_schema(idx: int, item: dict, canonical_name: str) -> d
     return {
         'visual_id': f"wikiart_{idx}",
         'title': item.get('title', 'Unknown Title'),
-        # Enforce clean Title Case format for the database metadata index files
         'artist': canonical_name.title(), 
         'filename': f"wikiart_{idx}.jpg",
         'ImageURL': f"hf://wikiart/{idx}",
@@ -62,28 +68,33 @@ def transform_to_standard_schema(idx: int, item: dict, canonical_name: str) -> d
 def wikiart_image_first_generator(stream, labels: list, authority_set: set):
     """
     Transforms the incoming Hugging Face dataset stream by matching names 
-    against a curation filter on-the-fly and emitting standardized data blocks.
+    against a curation filter on-the-fly, with real-time uniqueness tracking logs.
     """
     print(f"\n📢 Robust Matcher Active: Evaluating stream against {len(authority_set):,} target artists...")
     
     total_scanned = 0
     total_matched = 0
+    # Live runtime inventory ledger
+    ingested_artists_tracker = set()
 
     for idx, item in enumerate(stream):
         total_scanned += 1
         
-        # Pull text out of the categorical record layer
         raw_artist_name = resolve_artist_string(item, labels)
-        
-        # Check text maps against our allowed user requirements
         matched_canonical_name = scan_authority_manifest(raw_artist_name, authority_set)
         
-        # Pulse telemetry indicators every 1,000 processed stream elements
-        if total_scanned % 1000 == 0:
-            log_stream_heartbeat(total_scanned, total_matched)
-
         if matched_canonical_name is not None:
             total_matched += 1
+            # Track uniqueness using the formatted Title Case string
+            canonical_title_case = matched_canonical_name.title()
+            ingested_artists_tracker.add(canonical_title_case)
             
-            # Map parameters into our database standard structural frame
+            # Pulse the status dashboard every 1,000 scanned items
+            if total_scanned % 1000 == 0:
+                log_stream_heartbeat(total_scanned, total_matched, ingested_artists_tracker)
+
             yield transform_to_standard_schema(idx, item, matched_canonical_name)
+        else:
+            # Still pulse heartbeat even if the block had no matches so the screen doesn't freeze
+            if total_scanned % 1000 == 0:
+                log_stream_heartbeat(total_scanned, total_matched, ingested_artists_tracker)
