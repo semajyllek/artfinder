@@ -281,3 +281,85 @@ def execute_visual_3panel_validation(state, num_displays=3, nprobe=8):
                 
         # Fire off our visual multi-plot renderer
         show_3panel(state, simulated_user_photo, matched_meta['id'] if matched_meta else None, pid, D[0][0] if len(D) > 0 else 0.0)
+
+
+
+
+def display_engine_diagnostic_report(state, top_n_artists=10):
+    """
+    Analyzes and prints a comprehensive health and inventory summary of the 
+    active search engine, indexing models, cluster boundaries, and dataset distribution.
+    """
+    import pandas as pd
+    from .config import Config
+
+    print("📊 --- ARTFINDER SEARCH ENGINE DIAGNOSTIC REPORT --- 📊\n")
+    
+    # 1. Fetch Engine & RAM Context
+    df_meta = state.source_df
+    if df_meta is None or df_meta.empty:
+        print("⚠️ Diagnostic Warning: Active state metadata cache is empty or uninitialized.")
+        return
+
+    total_paintings = len(df_meta)
+    unique_artists = df_meta['artist'].nunique() if 'artist' in df_meta.columns else 0
+    
+    # 2. Extract FAISS Structural Status
+    has_index = state.index is not None
+    if has_index:
+        total_vectors = state.index.ntotal
+        # Check if it's a true IVF index to pull clusters safely
+        is_ivf = hasattr(state.index, 'nlist')
+        num_clusters = state.index.nlist if is_ivf else "N/A (Flat Brute-Force Mode)"
+        current_nprobe = state.index.nprobe if hasattr(state.index, 'nprobe') else "N/A"
+    else:
+        total_vectors = 0
+        num_clusters = "No index loaded"
+        current_nprobe = "N/A"
+
+    # 3. Print Structural Overview
+    print("📈 --- SYSTEM TOPOLOGY & HARDWARE BOUNDARIES ---")
+    print(f"  • Total Active Indexed Paintings: {total_paintings:,}")
+    print(f"  • Total Distinct Loaded Artists: {unique_artists:,}")
+    print(f"  • Total Extracted ORB Vectors:   {total_vectors:,}")
+    print(f"  • Active Indexing Cluster Slots:  {num_clusters}")
+    print(f"  • Configured Search Depth (nprobe): {current_nprobe} / {Config.CLUSTERS if has_index else 'N/A'}")
+    print(f"  • Fixed Sizing Slices (Config):  {Config.N_FEATURES} features | {Config.DIMENSION} dimensions")
+    print(f"  • Cloud Storage Active Target:   gs://{Config.BUCKET_NAME}/{Config.META_PATH}")
+    print("-" * 50)
+
+    # 4. Calculate Inventory Distributions
+    if 'artist' in df_meta.columns:
+        print(f"\n🎨 --- TOP {top_n_artists} PROLIFIC ARTISTS IN VAULT ---")
+        # Build count distribution maps
+        artist_counts = (
+            df_meta.groupby('artist')
+            .size()
+            .reset_index(name='paintings')
+            .sort_values(by='paintings', ascending=False)
+            .reset_index(drop=True)
+        )
+        
+        # Calculate vector ranges per artist for validation reporting
+        artist_vectors = []
+        for name in artist_counts.head(top_n_artists)['artist']:
+            artist_slice = df_meta[df_meta['artist'] == name]
+            v_count = 0
+            for _, row in artist_slice.iterrows():
+                v_count += (int(row['end_row']) - int(row['start_row']) + 1)
+            artist_vectors.append(v_count)
+            
+        # Merge metrics into a clean scannable display matrix
+        top_df = artist_counts.head(top_n_artists).copy()
+        top_df['total_vectors'] = artist_vectors
+        top_df.index = top_df.index + 1
+        
+        # Display cleanly in terminal/notebook
+        print(top_df.to_string(formatters={
+            'paintings': '{:,}'.format,
+            'total_vectors': '{:,}'.format
+        }))
+    else:
+        print("\n⚠️ Diagnostic Warning: 'artist' category column missing from source frames.")
+        
+    print("\n🏁 --- END OF DIAGNOSTIC STATUS REPORT --- 🏁")
