@@ -208,3 +208,61 @@ def execute_live_notebook_benchmark(state, sample_size=100):
             correct_matches += 1
 
     return (correct_matches / sample_size) if sample_size > 0 else 0.0, (total_latency_ms / sample_size) if sample_size > 0 else 0.0
+
+
+def execute_visual_3panel_validation(state, num_displays=3, nprobe=8):
+    """
+    Downloads raw frames from GCS, distorts them, and evaluates accuracy 
+    visually inside a notebook environment via a 3-panel plotting matrix.
+    """
+    import random
+    from .vault.builder import load_source_metadata
+    
+    print(f"\n🎨 Launching Interactive 3-Way Visual Validation (Displaying {num_displays} samples)...")
+    state.index.nprobe = nprobe
+    df_meta = load_source_metadata(state.bucket)
+    
+    if df_meta.empty:
+        print("⚠️ State metadata is empty. Cannot extract imagery panel maps.")
+        return
+        
+    valid_records = df_meta.dropna(subset=['id']).to_dict('records')
+    random.seed(1337)
+    selected_records = random.sample(valid_records, k=min(num_displays, len(valid_records)))
+    
+    for idx, record in enumerate(selected_records):
+        print(f"\nProcessing Visual Inspection #{idx+1}: '{record['title']}' by {record['artist']}")
+        
+        pid = str(record['id'])
+        blob = state.bucket.blob(f"images/{pid}.jpg")
+        
+        if not blob.exists():
+            print(f"  ⚠️ Skipping image display: 'images/{pid}.jpg' missing in cloud storage.")
+            continue
+            
+        ground_truth_img = Image.open(BytesIO(blob.download_as_bytes())).convert('RGB')
+        ground_truth_np = np.array(ground_truth_img)
+        
+        simulated_user_photo = apply_simulation(ground_truth_np)
+        kp, des = state.orb.detectAndCompute(simulated_user_photo, None)
+        
+        if des is None or len(des) == 0: 
+            continue
+            
+        if len(des) > Config.N_FEATURES:
+            des = des[:Config.N_FEATURES]
+        elif len(des) < Config.N_FEATURES:
+            padding = np.zeros((Config.N_FEATURES - len(des), 32), dtype=np.uint8)
+            des = np.vstack([des, padding])
+            
+        D, I = state.index.search(des, k=1)
+        predicted_row_idx = I[0][0]
+        
+        matched_meta = None
+        for lookup_rec in valid_records:
+            if lookup_rec['start_row'] <= predicted_row_idx <= lookup_rec['end_row']:
+                matched_meta = lookup_rec
+                break
+                
+        # Fire off our visual multi-plot renderer
+        show_3panel(state, simulated_user_photo, matched_meta['id'] if matched_meta else None, pid, D[0][0] if len(D) > 0 else 0.0)
