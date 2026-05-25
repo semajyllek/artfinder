@@ -127,34 +127,49 @@ def apply_simulation(img_np):
     return cv2.GaussianBlur(img_np, (5, 5), 0)
 
 
+
 def show_3panel(state, test_photo, pred_id, true_id, confidence):
-    """Renders visual performance comparisons."""
+    """Renders clean, structured 3-panel visual performance comparisons."""
     meta = None
     if pred_id:
         r = state.source_df[state.source_df['id'] == pred_id]
-        if not r.empty: meta = r.iloc[0]
+        if not r.empty: 
+            meta = r.iloc[0]
         
     try:
         blob = state.bucket.blob(f"images/{true_id}.jpg")
         true_img = Image.open(BytesIO(blob.download_as_bytes()))
-    except: return
+    except: 
+        return
 
     pred_img = None
-    if meta:
+    
+    if meta is not None:
         try:
             p_blob = state.bucket.blob(f"images/{meta['id']}.jpg")
             pred_img = Image.open(BytesIO(p_blob.download_as_bytes()))
-        except: pass
+        except: 
+            pass
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    axes[0].imshow(test_photo); axes[0].set_title("1. Simulated User Photo"); axes[0].axis('off')
+    axes[0].imshow(test_photo)
+    axes[0].set_title("1. Simulated User Photo")
+    axes[0].axis('off')
+    
     if pred_img:
         axes[1].imshow(pred_img)
         axes[1].set_title(f"2. Prediction: {meta['title']}\nConf: {confidence:.2f}")
+    else:
+        axes[1].text(0.5, 0.5, "No Match Image Resolved", ha='center', va='center')
+        axes[1].set_title("2. System Prediction")
     axes[1].axis('off')
-    axes[2].imshow(true_img); axes[2].set_title(f"3. Ground Truth\n{true_id}"); axes[2].axis('off')
+    
+    axes[2].imshow(true_img)
+    axes[2].set_title(f"3. Ground Truth\nTarget ID: {true_id}")
+    axes[2].axis('off')
+    
+    plt.tight_layout()
     plt.show()
-
 
 def load_production_brain(state):
     """Downloads index structures and metadata parquets directly from GCS."""
