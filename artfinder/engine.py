@@ -1,8 +1,9 @@
-import cv2
+# artfinder/engine.py
 import os
-import pandas as pd
-import re
+import cv2
 import csv
+import re
+import time
 import urllib.request
 from dataclasses import dataclass
 from google.cloud import storage
@@ -13,70 +14,99 @@ from .config import Config
 
 @dataclass
 class SearchEngineState:
+    """
+    Maintains active system configurations, authenticated cloud buckets, 
+    and vector index cache matrices across the runtime environment.
+    """
     client:        storage.Client
     bucket:        storage.Bucket
     authority_set: set
     orb:           cv2.Feature2D
-    index:     object = None
-    source_df: object = None
+    index:         object = None
+    source_df:     object = None
 
-def build_search_indices(state):
-    """Performs K-means clustering on vaulted vectors to create an IVF index."""
-    from .vault.builder import recover_state
-    _, master_index = recover_state(state)
-    n_total = master_index.ntotal
-    print(f"Reconstructing {n_total:,} vectors for training...")
-    all_vectors = master_index.reconstruct_n(0, n_total)
-    
-    quantizer = faiss.IndexBinaryFlat(Config.DIMENSION)
-    index_ivf = faiss.IndexBinaryIVF(quantizer, Config.DIMENSION, Config.CLUSTERS)
-    
-    print(f"Training IVF Index with {Config.CLUSTERS} centroids...")
-    index_ivf.train(all_vectors)
-    index_ivf.add(all_vectors)
-    
-    faiss.write_index_binary(index_ivf, Config.LOCAL_INDEX)
-    state.index = index_ivf
-    print(f"✅ Search Index rebuilt successfully with {index_ivf.ntotal:,} vectors.")
+
+def build_authority_set():
+    """
+    Downloads the master curated artist list and flattens all string entries 
+    to lowercase to ensure flawless matching against incoming dataset streams.
+    """
+    AUTH_URL = "https://raw.githubusercontent.com/oobabooga/stable-diffusion-automatic/master/artists.csv"
+    try:
+        with urllib.request.urlopen(AUTH_URL) as response:
+            lines = [line.decode('utf-8') for line in response.readlines()]
+        
+        # Force entire set comprehension to lowercase and clear loose spacing
+        return {row['artist'].lower().strip() for row in csv.DictReader(lines) if 'artist' in row}
+    except Exception as e:
+        print(f"⚠️ Warning: Could not fetch remote authority set due to connection error: {e}")
+        print("  Falling back to a resilient structural base configuration.")
+        return {"titian", "tintoretto", "raphael", "canaletto"}
+
 
 def setup_gcs():
+    """Authenticates the environment session and mounts the target storage bucket."""
     auth.authenticate_user()
     client = storage.Client(project=Config.PROJECT_ID)
     bucket = client.get_bucket(Config.BUCKET_NAME)
     return client, bucket
 
 
-def build_authority_set():
-    """
-    Downloads the master artist list and flattens all string entries 
-    to lowercase to ensure flawless matching against incoming image streams.
-    """
-    import urllib.request
-    import csv
-    
-    AUTH_URL = "https://raw.githubusercontent.com/oobabooga/stable-diffusion-automatic/master/artists.csv"
-    with urllib.request.urlopen(AUTH_URL) as response:
-        lines = [line.decode('utf-8') for line in response.readlines()]
-    
-    # 🌟 FIXED: Force the entire set comprehension to be lowercase
-    return {row['artist'].lower().strip() for row in csv.DictReader(lines) if 'artist' in row}
-
-
 def initialize_engine():
+    """
+    Instantiates global cloud structures, downloads curation matrices, and 
+    configures localized ORB descriptor extraction configurations.
+    """
     client, bucket = setup_gcs()
-    auth_set  = build_authority_set()
-    orb       = cv2.ORB_create(
-                    nfeatures   = Config.N_FEATURES,
-                    scaleFactor = Config.SCALE_FACTOR,
-                    nlevels     = Config.N_LEVELS,
-                    WTA_K       = Config.WTA_K,
-                )
+    auth_set = build_authority_set()
+    
+    print(f"💡 Engine Initialization: Loaded {len(auth_set):,} curated artists into the matching set.")
+    
+    orb = cv2.ORB_create(
+        nfeatures   = Config.N_FEATURES,
+        scaleFactor = Config.SCALE_FACTOR,
+        nlevels     = Config.N_LEVELS,
+        WTA_K       = Config.WTA_K,
+    )
     return SearchEngineState(client, bucket, auth_set, orb)
 
 
+def build_search_indices(state):
+    """
+    Extracts flat array blocks out of the unclustered binary vault and 
+    compiles them into a partitioned IVF binary search index.
+    """
+    from .vault.builder import recover_state
+    _, master_index = recover_state(state)
+    n_total = master_index.ntotal
+    
+    if n_total < Config.CLUSTERS:
+        print(f"⚠️ Warning: Total vectors ({n_total:,}) is less than requested clusters ({Config.CLUSTERS}).")
+        print("  Adjusting training layout to execute a flat brute-force calculation mode.")
+        index_ivf = faiss.IndexBinaryFlat(Config.DIMENSION)
+        index_ivf.add(master_index.reconstruct_n(0, n_total))
+    else:
+        print(f"🔄 Reconstructing {n_total:,} vectors for IVF cluster quantization...")
+        all_vectors = master_index.reconstruct_n(0, n_total)
+        
+        quantizer = faiss.IndexBinaryFlat(Config.DIMENSION)
+        index_ivf = faiss.IndexBinaryIVF(quantizer, Config.DIMENSION, Config.CLUSTERS)
+        
+        print(f"📐 Training IVF Index with {Config.CLUSTERS} distinct centroid neighborhoods...")
+        index_ivf.train(all_vectors)
+        index_ivf.add(all_vectors)
+    
+    # Cache index modifications locally
+    faiss.write_index_binary(index_ivf, Config.LOCAL_INDEX)
+    state.index = index_ivf
+    print(f"✅ Search Index compiled successfully with {index_ivf.ntotal:,} active vectors.")
+
+
 def run_complete_system_rebuild(state):
-    """Orchestrates the entire image-first rebuild pipeline entirely within functions."""
-    import time
+    """
+    Master pipeline orchestrator. Wipes active storage caches, streams raw 
+    image data layers, computes ORB matrices, and trains the index.
+    """
     from datasets import load_dataset
     from .vault.builder import VaultBuilder, purge_local_cache_files, purge_gcs_production_vault
     from .intake.wikiart import wikiart_image_first_generator
@@ -85,9 +115,11 @@ def run_complete_system_rebuild(state):
     start_wall_time = time.time()
     print("🚧 --- STARTING TOTAL ENGINE RECONSTRUCTION --- 🚧\n")
     
+    # Step 1: Wipe the slate completely clean
     purge_local_cache_files()
     purge_gcs_production_vault(state)
     
+    # Step 2: Establish connection streams to the image database layer
     print("\n📦 Opening Hugging Face WikiArt Dataset stream layers...")
     wikiart_stream = load_dataset("huggan/wikiart", split="train", streaming=True)
     artist_labels = wikiart_stream.features['artist'].names
@@ -98,12 +130,16 @@ def run_complete_system_rebuild(state):
         authority_set=state.authority_set
     )
     
-    print(f"🚀 Extracting ORB features for {len(state.authority_set)} target artists...")
+    # Step 3: Extract descriptors and checkpoint records upstream
+    print(f"🚀 Processing images and extracting visual feature matrices...")
     builder = VaultBuilder(state)
     builder.ingest_stream(data_stream=curated_stream, batch_name="wikiart_foundational_layer")
     
+    # Step 4: Compress flat storage points into partitioned Voronoi cells
+    print("\n🔄 Compiling flat vector points into organized IVF clusters...")
     build_search_indices(state)
     
+    # Step 5: Push completed search index binary back to GCS
     print(f"📤 Uploading local '{Config.LOCAL_INDEX}' to GCS destination '{Config.INDEX_PATH}'...")
     if os.path.exists(Config.LOCAL_INDEX):
         blob = state.bucket.blob(Config.INDEX_PATH)
@@ -112,10 +148,12 @@ def run_complete_system_rebuild(state):
     else:
         raise FileNotFoundError(f"❌ Expected local index file at '{Config.LOCAL_INDEX}' is missing.")
     
+    # Step 6: Synchronize and bring the brain pointers live in memory
     print("\n🧠 Activating new production brain pointers...")
     load_production_brain(state)
     state.index.nprobe = 8
     
+    # Step 7: Run immediate verification benchmark pass
     print("\n📈 Executing verification benchmark across clean asset maps...")
     accuracy, latency = execute_live_notebook_benchmark(state, sample_size=100)
     
