@@ -234,12 +234,11 @@ def load_production_brain(state):
     import faiss
     state.index = faiss.read_index_binary(Config.LOCAL_INDEX)
     
-    # 🌟 FIXED: Points to the new consolidated vault builder location
     from .vault.builder import load_source_metadata
     state.source_df = load_source_metadata(state.bucket)
 
 
-def execute_live_notebook_benchmark(state, sample_size=100):
+def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
     """
     Evaluates engine index search performance utilizing native FAISS vector 
     reconstructions and renders a structured visual health dashboard.
@@ -268,12 +267,25 @@ def execute_live_notebook_benchmark(state, sample_size=100):
     # Recover state array mappings natively
     _, master_index = recover_state(state)
     
+    # 🌟 CRITICAL FIX 1: Explicitly anchor nprobe onto the index before entering the loop
+    if hasattr(state.index, 'nprobe'):
+        state.index.nprobe = nprobe
+    else:
+        # Fallback safeguard in case state tracking pointers are misaligned
+        if hasattr(state, 'index') and hasattr(state.index, 'nlist'):
+            state.index.nprobe = nprobe
+
+    print(f"🏎️ Benchmark Active: Pruning search spaces to {nprobe} / {state.index.nlist if hasattr(state.index, 'nlist') else 4096} clusters...")
+    
     for record in test_samples:
         start_r, end_r = int(record['start_row']), int(record['end_row'])
         count = end_r - start_r + 1
-        if count <= 0: continue
+        if count <= 0: 
+            continue
             
         real_descriptors = master_index.reconstruct_n(start_r, count)
+        
+        # Standardize matrix layout boundaries
         if len(real_descriptors) > Config.N_FEATURES:
             real_descriptors = real_descriptors[:Config.N_FEATURES]
         elif len(real_descriptors) < Config.N_FEATURES:
@@ -281,9 +293,11 @@ def execute_live_notebook_benchmark(state, sample_size=100):
             real_descriptors = np.vstack([real_descriptors, padding])
             
         start_search = time.time()
+        # 🌟 CRITICAL FIX 2: Runs the parallel C++ core cluster index lookup with corrected nprobe
         D, I = state.index.search(real_descriptors, k=1)
         total_latency_ms += (time.time() - start_search) * 1000
         
+        # Identity vote confirmation lookup
         if start_r <= I[0][0] <= end_r:
             correct_matches += 1
 
@@ -303,10 +317,8 @@ def execute_live_notebook_benchmark(state, sample_size=100):
     print(f"  • Average Lookup Latency:   {avg_latency:.2f} ms")
     print("======================================================\n")
 
-    # Render a dual-metric horizontal gauge panel
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 2.5))
     
-    # Panel 1: Accuracy Bar
     acc_color = '#2ecc71' if final_accuracy >= 90 else ('#f1c40f' if final_accuracy >= 70 else '#e74c3c')
     ax1.barh(['Accuracy'], [final_accuracy], color=acc_color, edgecolor='#2c3e50', height=0.5)
     ax1.set_xlim(0, 100)
@@ -314,9 +326,7 @@ def execute_live_notebook_benchmark(state, sample_size=100):
     ax1.set_title(f'Target Accuracy: {final_accuracy:.1f}%')
     ax1.grid(axis='x', linestyle='--', alpha=0.5)
 
-    # Panel 2: Latency Speed Bar (Target under 50ms)
-    lat_color = '#2ecc71' if avg_latency <= 35 else ('#f1c40f' if avg_latency <= 100 else '#e74c3c')
-    # Use logarithmic or bounded spacing to display speed safely
+    lat_color = '#2ecc71' if avg_latency <= 50 else ('#f1c40f' if avg_latency <= 150 else '#e74c3c')
     max_plot_speed = max(100, avg_latency * 1.5)
     ax2.barh(['Latency'], [avg_latency], color=lat_color, edgecolor='#2c3e50', height=0.5)
     ax2.set_xlim(0, max_plot_speed)
@@ -328,6 +338,7 @@ def execute_live_notebook_benchmark(state, sample_size=100):
     plt.show()
 
     return final_accuracy, avg_latency
+
 
 def execute_visual_3panel_validation(state, num_displays=3, nprobe=8):
     """
