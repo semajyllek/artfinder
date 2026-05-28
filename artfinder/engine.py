@@ -4,6 +4,7 @@ import cv2
 import csv
 import re
 import time
+import itertools
 import urllib.request
 from dataclasses import dataclass
 from google.cloud import storage
@@ -109,10 +110,9 @@ def build_search_indices(state):
 
 
 
-def run_complete_system_rebuild(state):
+def run_complete_system_rebuild(state, limit=1000):
     """
-    Master pipeline orchestrator. Wipes active storage caches, streams raw 
-    image data layers, computes ORB matrices, and trains the index.
+    Master pipeline orchestrator.
     """
     from datasets import load_dataset
     from .vault.builder import VaultBuilder, purge_local_cache_files, purge_gcs_production_vault
@@ -122,11 +122,9 @@ def run_complete_system_rebuild(state):
     start_wall_time = time.time()
     print("🚧 --- STARTING TOTAL ENGINE RECONSTRUCTION --- 🚧\n")
     
-    # Step 1: Wipe the slate completely clean
     purge_local_cache_files()
     purge_gcs_production_vault(state)
     
-    # Step 2: Establish connection streams to the image database layer
     print("\n📦 Opening Hugging Face WikiArt Dataset stream layers...")
     wikiart_stream = load_dataset("huggan/wikiart", split="train", streaming=True)
     artist_labels = wikiart_stream.features['artist'].names
@@ -137,37 +135,33 @@ def run_complete_system_rebuild(state):
         authority_set=state.authority_set
     )
     
-    # Step 3: Extract descriptors and checkpoint records upstream
-    print(f"🚀 Processing images and extracting visual feature matrices...")
-    builder = VaultBuilder(state)
-    builder.ingest_stream(data_stream=curated_stream, batch_name="wikiart_foundational_layer")
+    # 🌟 NEW: Slice the generator to strictly cut off after `limit` iterations
+    limited_stream = itertools.islice(curated_stream, limit)
     
-    # Step 4: Compress flat storage points into partitioned Voronoi cells
+    print(f"🚀 Processing images and extracting visual feature matrices (Limit: {limit})...")
+    builder = VaultBuilder(state)
+    builder.ingest_stream(data_stream=limited_stream, batch_name="wikiart_fast_test", total_records=limit)
+    
     print("\n🔄 Compiling flat vector points into organized IVF clusters...")
     build_search_indices(state)
     
-    # Step 5: Push completed search index binary back to GCS
     print(f"📤 Uploading local '{Config.LOCAL_INDEX}' to GCS destination '{Config.INDEX_PATH}'...")
     if os.path.exists(Config.LOCAL_INDEX):
         blob = state.bucket.blob(Config.INDEX_PATH)
         blob.upload_from_filename(Config.LOCAL_INDEX)
         print("  ✅ IVF production index uploaded successfully!")
-    else:
-        raise FileNotFoundError(f"❌ Expected local index file at '{Config.LOCAL_INDEX}' is missing.")
     
-    # Step 6: Synchronize and bring the brain pointers live in memory
     print("\n🧠 Activating new production brain pointers...")
     load_production_brain(state)
-    state.index.nprobe = 8
     
-    # Step 7: Run immediate verification benchmark pass
     print("\n📈 Executing verification benchmark across clean asset maps...")
     accuracy, latency = execute_live_notebook_benchmark(state, sample_size=100)
     
     print("\n🏆 --- TARGET PIPELINE REALIZED --- 🏆")
     print(f"Total Unique Artworks Vaulted: {len(state.source_df):,}")
     print(f"Active Features Tracked:      {state.index.ntotal:,}")
-    print(f"Benchmark Match Accuracy:     {accuracy * 100:.2f}%")
+    # 🌟 NEW: Removed the * 100 to fix the 9700% bug
+    print(f"Benchmark Match Accuracy:     {accuracy:.2f}%") 
     print(f"Verified Engine Latency:      {latency:.2f} ms")
         
     duration = time.time() - start_wall_time

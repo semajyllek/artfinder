@@ -68,7 +68,10 @@ class ArtSearchEngine:
         standardized_des = self._standardize_query_descriptors(des)
         
         # 2. Vector Subspace Pruning Check
-        if hasattr(self.state.index, 'nprobe'):
+        # 🌟 NEW: FAISS IDMap wrappers hide the nprobe property. Drill into the core index.
+        if hasattr(self.state.index, 'index'):
+            self.state.index.index.nprobe = nprobe
+        elif hasattr(self.state.index, 'nprobe'):
             self.state.index.nprobe = nprobe
             
         # Parallel C++ batch cluster query execution
@@ -106,3 +109,5 @@ class ArtSearchEngine:
             confidence = confidence,
             latency_ms = latency_ms
         )
+
+
