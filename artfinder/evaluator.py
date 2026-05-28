@@ -1,11 +1,10 @@
-# artfinder/evaluator.py
 import time
 import random
 import numpy as np
 import matplotlib.pyplot as plt
 from .config import Config
 from .vault.builder import recover_state
-from .searcher import ArtSearchEngine  # 👈 IMPORT THE NEW SEARCH ENGINE
+from .searcher import ArtSearchEngine
 
 def load_production_brain(state):
     """Loads and mounts the remote production vault models from GCS storage."""
@@ -31,12 +30,12 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
     test_samples = random.sample(valid_records, k=sample_size)
     
     # 🌟 INITIALIZE THE INDEPENDENT ENGINE
+    # This engine automatically picks up the fast clustered state.index
     search_engine = ArtSearchEngine(state)
     
-    # We must temporarily use the flat index for code-level verification
-    # because the index reconstruction requires 1:1 row mappings
+    # We still need the flat vault locally strictly to extract authentic 
+    # vector blocks to simulate an image query input.
     _, flat_vault_index = recover_state(state)
-    original_trained_index = state.index
     
     correct_matches = 0
     latencies = []
@@ -56,11 +55,8 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
             padding = np.zeros((Config.N_FEATURES - len(real_descriptors), 32), dtype=np.uint8)
             real_descriptors = np.vstack([real_descriptors, padding])
             
-        # Point the engine to use the flat vault for deterministic row alignment checking
-        search_engine.state.index = flat_vault_index
-        
         # 🚀 EXECUTE INDEPENDENT PRODUCTION LOOKUP
-        # We pass fake image numpy arrays back, as our test images are represented via raw descriptors
+        # The engine natively uses its fast clustered index, bringing latency back to ms
         start_search = time.time()
         D, I = search_engine.state.index.search(real_descriptors, k=1)
         latency_ms = (time.time() - start_search) * 1000
@@ -77,9 +73,6 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
             predicted_id = max(identity_tally, key=identity_tally.get)
             if predicted_id == record['id']:
                 correct_matches += 1
-
-    # Restore the production brain index reference state
-    state.index = original_trained_index
 
     # Calculate metrics
     final_accuracy = (correct_matches / sample_size) * 100 if sample_size > 0 else 0.0

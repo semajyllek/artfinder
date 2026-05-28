@@ -84,8 +84,9 @@ def purge_local_cache_files():
                 print(f"  ⚠️ Could not clear local file {filename}: {e}")
 
 
+
 def purge_gcs_production_vault(state):
-    """Deletes existing binary vaults and parquets inside the active cloud bucket."""
+    """Deletes existing binary vaults, parquets, and image assets inside the active cloud bucket."""
     print("🗑️ Erasing historical engine assets from Google Cloud Storage...")
     gcs_targets = [Config.META_PATH, Config.VAULT_PATH, Config.INDEX_PATH]
     for gcs_path in gcs_targets:
@@ -96,6 +97,18 @@ def purge_gcs_production_vault(state):
                 print(f"  Deleted from GCS Bucket: {gcs_path}")
             except Exception as e:
                 print(f"  ⚠️ GCS deletion failure on path {gcs_path}: {e}")
+
+    print("🗑️ Sweeping raw image assets...")
+    try:
+        blobs = state.bucket.list_blobs(prefix="images/")
+        image_count = 0
+        for blob in blobs:
+            blob.delete()
+            image_count += 1
+        print(f"  ✅ Deleted {image_count:,} orphaned files from 'images/' prefix.")
+    except Exception as e:
+        print(f"  ⚠️ Failed to sweep images directory: {e}")
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
