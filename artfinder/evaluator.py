@@ -2,22 +2,30 @@ import time
 import random
 import numpy as np
 import matplotlib.pyplot as plt
+import faiss
 from .config import Config
-from .vault.builder import recover_state
 from .searcher import ArtSearchEngine
 
 def load_production_brain(state):
-    """Loads and mounts the remote production vault models from GCS storage."""
+    """Loads and mounts the remote production IVF models from GCS storage."""
     print("🧠 Downloading Production Brain from GCS...")
-    recover_state(state)
-    print(f"  ✅ Brain loaded. Active Metadata Records: {len(state.source_df):,}")
+    
+    # 1. Load the metadata safely
+    from .vault.builder import load_source_metadata
+    state.source_df = load_source_metadata(state.bucket)
+    
+    # 2. Download ONLY the fast IVF cluster index to memory
+    blob = state.bucket.blob(Config.INDEX_PATH)
+    if blob.exists():
+        blob.download_to_filename(Config.LOCAL_INDEX)
+        state.index = faiss.read_index_binary(Config.LOCAL_INDEX)
+        print(f"  ✅ Brain loaded. Active Metadata Records: {len(state.source_df):,}")
+    else:
+        print("  ⚠️ IVF Index not found in GCS! Cannot load brain.")
 
 
 def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
-    """
-    Evaluates system search accuracy and latency profiles using the standalone
-    ArtSearchEngine module, rendering a clean performance dashboard.
-    """
+    """Evaluates system search accuracy and latency profiles using the standalone module."""
     df_meta = state.source_df
     if df_meta is None or df_meta.empty:
         print("⚠️ State metadata is empty. Aborting benchmark.")
@@ -29,13 +37,12 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
     random.seed(42)
     test_samples = random.sample(valid_records, k=sample_size)
     
-    # 🌟 INITIALIZE THE INDEPENDENT ENGINE
-    # This engine automatically picks up the fast clustered state.index
     search_engine = ArtSearchEngine(state)
     
-    # We still need the flat vault locally strictly to extract authentic 
-    # vector blocks to simulate an image query input.
-    _, flat_vault_index = recover_state(state)
+    # 🌟 THE FIX: Isolate the raw vectors without mutating the global state
+    print("📦 Downloading isolated raw vault for test queries...")
+    state.bucket.blob(Config.VAULT_PATH).download_to_filename(Config.LOCAL_VAULT)
+    flat_vault_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     
     correct_matches = 0
     latencies = []
@@ -47,7 +54,6 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
         count = end_r - start_r + 1
         if count <= 0: continue
             
-        # Extract authentic vector blocks to simulate an image query input
         real_descriptors = flat_vault_index.reconstruct_n(start_r, count)
         if len(real_descriptors) > Config.N_FEATURES:
             real_descriptors = real_descriptors[:Config.N_FEATURES]
@@ -55,14 +61,13 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
             padding = np.zeros((Config.N_FEATURES - len(real_descriptors), 32), dtype=np.uint8)
             real_descriptors = np.vstack([real_descriptors, padding])
             
-        # 🚀 EXECUTE INDEPENDENT PRODUCTION LOOKUP
-        # The engine natively uses its fast clustered index, bringing latency back to ms
+        # Natively uses the fast clustered index. 
+        # (Ensure you also applied the searcher.py nprobe fix from earlier!)
         start_search = time.time()
         D, I = search_engine.state.index.search(real_descriptors, k=1)
         latency_ms = (time.time() - start_search) * 1000
         latencies.append(latency_ms)
         
-        # Tally matches via the search engine's internal map
         identity_tally = {}
         for row_idx in I.flatten():
             if row_idx in search_engine.row_to_metadata_map:
@@ -74,11 +79,9 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
             if predicted_id == record['id']:
                 correct_matches += 1
 
-    # Calculate metrics
     final_accuracy = (correct_matches / sample_size) * 100 if sample_size > 0 else 0.0
     avg_latency = np.mean(latencies) if latencies else 0.0
 
-    # Render dashboard report charts
     print("\n🏁 ================================================== 🏁")
     print("📈 --- ARTFINDER RUNTIME PERFORMANCE DASHBOARD --- 📈")
     print("======================================================")
@@ -87,21 +90,5 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
     print(f"  • Match Verification Rate:  {final_accuracy:.2f}%")
     print(f"  • Average Lookup Latency:   {avg_latency:.2f} ms")
     print("======================================================\n")
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 2.5))
-    acc_color = '#2ecc71' if final_accuracy >= 90 else '#e74c3c'
-    ax1.barh(['Accuracy'], [final_accuracy], color=acc_color, edgecolor='#2c3e50', height=0.5)
-    ax1.set_xlim(0, 100)
-    ax1.set_title(f'True Accuracy: {final_accuracy:.1f}%')
-    ax1.grid(axis='x', linestyle='--', alpha=0.5)
-
-    lat_color = '#2ecc71' if avg_latency <= 50 else '#e74c3c'
-    ax2.barh(['Latency'], [avg_latency], color=lat_color, edgecolor='#2c3e50', height=0.5)
-    ax2.set_xlim(0, max(50, avg_latency * 1.5))
-    ax2.set_title(f'Search Speed: {avg_latency:.2f} ms')
-    ax2.grid(axis='x', linestyle='--', alpha=0.5)
-    
-    plt.tight_layout()
-    plt.show()
 
     return final_accuracy, avg_latency
