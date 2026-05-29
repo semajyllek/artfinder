@@ -1,5 +1,7 @@
+# artfinder/evaluator.py
 import time
 import random
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import faiss
@@ -10,11 +12,9 @@ def load_production_brain(state):
     """Loads and mounts the remote production IVF models from GCS storage."""
     print("🧠 Downloading Production Brain from GCS...")
     
-    # 1. Load the metadata safely
     from .vault.builder import load_source_metadata
     state.source_df = load_source_metadata(state.bucket)
     
-    # 2. Download ONLY the fast IVF cluster index to memory
     blob = state.bucket.blob(Config.INDEX_PATH)
     if blob.exists():
         blob.download_to_filename(Config.LOCAL_INDEX)
@@ -24,11 +24,11 @@ def load_production_brain(state):
         print("  ⚠️ IVF Index not found in GCS! Cannot load brain.")
 
 
-def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
-    """Evaluates system search accuracy and latency profiles using the standalone module."""
+def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=True):
+    """Evaluates system search accuracy and latency profiles."""
     df_meta = state.source_df
     if df_meta is None or df_meta.empty:
-        print("⚠️ State metadata is empty. Aborting benchmark.")
+        if verbose: print("⚠️ State metadata is empty. Aborting benchmark.")
         return 0.0, 0.0
         
     valid_records = df_meta.dropna(subset=['id']).to_dict('records')
@@ -36,18 +36,16 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
     
     random.seed(42)
     test_samples = random.sample(valid_records, k=sample_size)
-    
     search_engine = ArtSearchEngine(state)
     
-    # 🌟 THE FIX: Isolate the raw vectors without mutating the global state
-    print("📦 Downloading isolated raw vault for test queries...")
+    if verbose: print("📦 Downloading isolated raw vault for test queries...")
     state.bucket.blob(Config.VAULT_PATH).download_to_filename(Config.LOCAL_VAULT)
     flat_vault_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     
     correct_matches = 0
     latencies = []
     
-    print(f"🏎️ Benchmark Active: Running performance passes over {sample_size} samples...")
+    if verbose: print(f"🏎️ Benchmark Active: Running performance passes over {sample_size} samples...")
     
     for record in test_samples:
         start_r, end_r = int(record['start_row']), int(record['end_row'])
@@ -61,8 +59,6 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
             padding = np.zeros((Config.N_FEATURES - len(real_descriptors), 32), dtype=np.uint8)
             real_descriptors = np.vstack([real_descriptors, padding])
             
-        # Natively uses the fast clustered index. 
-        # (Ensure you also applied the searcher.py nprobe fix from earlier!)
         start_search = time.time()
         D, I = search_engine.state.index.search(real_descriptors, k=1)
         latency_ms = (time.time() - start_search) * 1000
@@ -82,13 +78,86 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8):
     final_accuracy = (correct_matches / sample_size) * 100 if sample_size > 0 else 0.0
     avg_latency = np.mean(latencies) if latencies else 0.0
 
-    print("\n🏁 ================================================== 🏁")
-    print("📈 --- ARTFINDER RUNTIME PERFORMANCE DASHBOARD --- 📈")
-    print("======================================================")
-    print(f"  • Total Images Evaluated:   {sample_size:,}")
-    print(f"  • Total Successful Matches: {correct_matches} / {sample_size}")
-    print(f"  • Match Verification Rate:  {final_accuracy:.2f}%")
-    print(f"  • Average Lookup Latency:   {avg_latency:.2f} ms")
-    print("======================================================\n")
+    if verbose:
+        print("\n🏁 ================================================== 🏁")
+        print("📈 --- ARTFINDER RUNTIME PERFORMANCE DASHBOARD --- 📈")
+        print("======================================================")
+        print(f"  • Total Images Evaluated:   {sample_size:,}")
+        print(f"  • Total Successful Matches: {correct_matches} / {sample_size}")
+        print(f"  • Match Verification Rate:  {final_accuracy:.2f}%")
+        print(f"  • Average Lookup Latency:   {avg_latency:.2f} ms")
+        print("======================================================\n")
 
     return final_accuracy, avg_latency
+
+
+def run_scaling_stress_test(state, n_sizes=[10, 50, 100, 250, 500]):
+    """Runs the benchmark across scaling input sizes to verify cluster O(1) latency."""
+    print("🚀 Initiating N-Size Scaling Test...")
+    accuracies = []
+    latencies = []
+
+    for size in n_sizes:
+        print(f"🧪 Testing Sample Size: {size}...")
+        # Run silently to avoid spamming the console
+        acc, lat = execute_live_notebook_benchmark(state, sample_size=size, verbose=False)
+        accuracies.append(acc)
+        latencies.append(lat)
+
+    # Plot the scaling results
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+
+    color = 'tab:red'
+    ax1.set_xlabel('Sample Size (N)')
+    ax1.set_ylabel('Average Latency (ms)', color=color)
+    ax1.plot(n_sizes, latencies, marker='o', color=color, linewidth=2, label='Latency')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_ylim(0, max(latencies) * 1.5)
+
+    ax2 = ax1.twinx()  
+    color = 'tab:blue'
+    ax2.set_ylabel('Accuracy (%)', color=color)
+    ax2.plot(n_sizes, accuracies, marker='s', color=color, linestyle='--', label='Accuracy')
+    ax2.tick_params(axis='y', labelcolor=color)
+    ax2.set_ylim(0, 105)
+
+    plt.title("Engine Scaling Performance (IVF Cluster Validation)")
+    fig.tight_layout()
+    plt.show()
+
+
+def visualize_orb_matches(query_img, match_result, state):
+    """Downloads the matched image from GCS and draws the visual point connections."""
+    print(f"\n🖼️ Fetching matched asset 'gs://{state.bucket.name}/images/{match_result.artwork_id}.jpg'...")
+    
+    try:
+        blob = state.bucket.blob(f"images/{match_result.artwork_id}.jpg")
+        img_bytes = blob.download_as_bytes()
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        matched_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        query_resized = cv2.resize(query_img, Config.RESIZE_DIM)
+        match_resized = cv2.resize(matched_img, Config.RESIZE_DIM)
+        
+        kp1, des1 = state.orb.detectAndCompute(query_resized, None)
+        kp2, des2 = state.orb.detectAndCompute(match_resized, None)
+        
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        matches = sorted(matches, key=lambda x: x.distance)
+        
+        img_matches = cv2.drawMatches(
+            query_resized, kp1, 
+            match_resized, kp2, 
+            matches[:50], None, 
+            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+        )
+        
+        plt.figure(figsize=(18, 8))
+        plt.imshow(cv2.cvtColor(img_matches, cv2.COLOR_BGR2RGB))
+        plt.title(f"Match: {match_result.title} by {match_result.artist} | Confidence: {match_result.confidence:.2%}")
+        plt.axis('off')
+        plt.show()
+        
+    except Exception as e:
+        print(f"⚠️ Could not render visual match: {e}")
