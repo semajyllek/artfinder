@@ -214,8 +214,8 @@ def _simulate_book_page(img_np):
     warped_page = np.clip(warped_page * shadow_gradient, 0, 255).astype(np.uint8)
 
     bg_color = [random.randint(120, 160) for _ in range(3)]
-    desk = np.full((h + int(amplitude*2), w + 40), bg_color, dtype=np.uint8)
-    
+    desk = np.full((h + int(amplitude*2), w + 40, 3), bg_color, dtype=np.uint8)   
+ 
     y_offset = int(amplitude)
     x_offset = 20
     desk[y_offset:y_offset+h, x_offset:x_offset+w] = warped_page
