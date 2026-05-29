@@ -24,8 +24,9 @@ def load_production_brain(state):
         print("  ⚠️ IVF Index not found in GCS! Cannot load brain.")
 
 
+
 def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=True):
-    """Evaluates system search accuracy and latency profiles."""
+    """Evaluates system search accuracy and latency using C++ matrix batching."""
     df_meta = state.source_df
     if df_meta is None or df_meta.empty:
         if verbose: print("⚠️ State metadata is empty. Aborting benchmark.")
@@ -34,19 +35,28 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
     valid_records = df_meta.dropna(subset=['id']).to_dict('records')
     sample_size = min(sample_size, len(valid_records))
     
+    import random
     random.seed(42)
     test_samples = random.sample(valid_records, k=sample_size)
     search_engine = ArtSearchEngine(state)
     
     if verbose: print("📦 Downloading isolated raw vault for test queries...")
     state.bucket.blob(Config.VAULT_PATH).download_to_filename(Config.LOCAL_VAULT)
+    import faiss
     flat_vault_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     
-    correct_matches = 0
-    latencies = []
+    # Ensure nprobe depth is applied securely through the IDMap wrapper
+    if hasattr(search_engine.state.index, 'index'):
+        search_engine.state.index.index.nprobe = nprobe
+    elif hasattr(search_engine.state.index, 'nprobe'):
+        search_engine.state.index.nprobe = nprobe
+        
+    if verbose: print(f"🏎️ Benchmark Active: Compiling C++ Matrix for {sample_size} samples...")
     
-    if verbose: print(f"🏎️ Benchmark Active: Running performance passes over {sample_size} samples...")
+    query_blocks = []
+    valid_test_samples = []
     
+    # 1. Compile the master query matrix (Eliminate Python Loop Overhead)
     for record in test_samples:
         start_r, end_r = int(record['start_row']), int(record['end_row'])
         count = end_r - start_r + 1
@@ -56,16 +66,36 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
         if len(real_descriptors) > Config.N_FEATURES:
             real_descriptors = real_descriptors[:Config.N_FEATURES]
         elif len(real_descriptors) < Config.N_FEATURES:
+            import numpy as np
             padding = np.zeros((Config.N_FEATURES - len(real_descriptors), 32), dtype=np.uint8)
             real_descriptors = np.vstack([real_descriptors, padding])
             
-        start_search = time.time()
-        D, I = search_engine.state.index.search(real_descriptors, k=1)
-        latency_ms = (time.time() - start_search) * 1000
-        latencies.append(latency_ms)
+        query_blocks.append(real_descriptors)
+        valid_test_samples.append(record)
+        
+    if not query_blocks:
+        return 0.0, 0.0
+        
+    import numpy as np
+    import time
+    master_query_matrix = np.vstack(query_blocks)
+    
+    # 2. Fire the single parallel batch execution
+    start_search = time.time()
+    D, I = search_engine.state.index.search(master_query_matrix, k=1)
+    total_latency_ms = (time.time() - start_search) * 1000
+    
+    # 3. Calculate true amortized average
+    avg_latency = total_latency_ms / len(valid_test_samples)
+    
+    # 4. Tally matches block by block
+    correct_matches = 0
+    for i, record in enumerate(valid_test_samples):
+        # Extract the 500 specific results for this single image
+        block_I = I[i * Config.N_FEATURES : (i + 1) * Config.N_FEATURES]
         
         identity_tally = {}
-        for row_idx in I.flatten():
+        for row_idx in block_I.flatten():
             if row_idx in search_engine.row_to_metadata_map:
                 item = search_engine.row_to_metadata_map[row_idx]
                 identity_tally[item['id']] = identity_tally.get(item['id'], 0) + 1
@@ -75,20 +105,20 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
             if predicted_id == record['id']:
                 correct_matches += 1
 
-    final_accuracy = (correct_matches / sample_size) * 100 if sample_size > 0 else 0.0
-    avg_latency = np.mean(latencies) if latencies else 0.0
+    final_accuracy = (correct_matches / len(valid_test_samples)) * 100 if valid_test_samples else 0.0
 
     if verbose:
         print("\n🏁 ================================================== 🏁")
         print("📈 --- ARTFINDER RUNTIME PERFORMANCE DASHBOARD --- 📈")
         print("======================================================")
-        print(f"  • Total Images Evaluated:   {sample_size:,}")
-        print(f"  • Total Successful Matches: {correct_matches} / {sample_size}")
+        print(f"  • Total Images Evaluated:   {len(valid_test_samples):,}")
+        print(f"  • Total Successful Matches: {correct_matches} / {len(valid_test_samples)}")
         print(f"  • Match Verification Rate:  {final_accuracy:.2f}%")
         print(f"  • Average Lookup Latency:   {avg_latency:.2f} ms")
         print("======================================================\n")
 
     return final_accuracy, avg_latency
+
 
 
 def run_scaling_stress_test(state, n_sizes=[10, 50, 100, 250, 500]):
