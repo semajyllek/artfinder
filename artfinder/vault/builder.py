@@ -67,6 +67,39 @@ def vault_checkpoint(state, new_records, master_index):
     state.source_df = updated_source
 
 
+
+def save_source_metadata(df, bucket):
+    """
+    Serializes the active metadata tracking dataframe to a local Parquet file 
+    and uploads it to the mounted GCS bucket.
+    """
+    # Serialize metadata updates to GCS
+    df.to_parquet(Config.LOCAL_META, index=False)
+    bucket.blob(Config.META_PATH).upload_from_filename(Config.LOCAL_META)
+
+
+def process_image(image_pil, orb):
+    """
+    Transforms a raw PIL image into a numpy matrix, applies dimensional scaling,
+    and extracts key visual features using the provided ORB algorithm.
+    """
+    import numpy as np
+    import cv2
+    from ..config import Config # Ensure this matches your directory structure
+    
+    # Convert PIL Image to NumPy array for OpenCV
+    img_np = np.array(image_pil)
+    
+    # Defensive verification
+    if not isinstance(img_np, np.ndarray):
+        return None
+
+    # Resize and compute features
+    resized = cv2.resize(img_np, Config.RESIZE_DIM)
+    kp, des = orb.detectAndCompute(resized, None)
+    
+    return des
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. RUNTIME WORKSPACE CLEANERS
 # ──────────────────────────────────────────────────────────────────────────────
