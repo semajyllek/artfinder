@@ -203,6 +203,7 @@ def _simulate_book_page(img_np):
     return desk
 
 
+
 def _simulate_aged_print(img_np):
     """Simulates fading, color shifting, and lighting changes typical of old prints/photos."""
     # Convert to float32 to prevent clipping math errors
@@ -231,7 +232,7 @@ def _simulate_aged_print(img_np):
     
     # Add a tiny bit of grain (ISO noise from a camera in a dark room)
     h, w = img_np.shape[:2]
-    noise = np.random.randint(-15, 15, (h, w, 3), dtype=np.float32)
+    noise = np.random.randint(-15, 15, (h, w, 3)).astype(np.float32) # <-- Fixed here
     img_float += noise
     
     # Clip back to valid color bounds and convert to standard image format
