@@ -97,6 +97,9 @@ def _commit_raw_storage(state, flat_vault, df_meta, new_vectors, new_records):
     updated_df = pd.concat([df_meta, new_df], ignore_index=True) if not df_meta.empty else new_df
     save_source_metadata(updated_df, state.bucket)
     
+    # 🌟 ADD THIS LINE: Keep live memory synchronized with what we just saved!
+    state.source_df = updated_df 
+    
     return flat_vault
 
 

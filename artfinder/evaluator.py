@@ -1,4 +1,3 @@
-# artfinder/evaluator.py
 import time
 import random
 import cv2
@@ -16,11 +15,9 @@ def load_production_brain(state):
     """Loads and mounts the remote production IVF models from GCS storage."""
     print("🧠 Downloading Production Brain from GCS...")
     
-    # 1. Load the metadata safely
     from .vault.builder import load_source_metadata
     state.source_df = load_source_metadata(state.bucket)
     
-    # 2. Download ONLY the fast IVF cluster index to memory
     blob = state.bucket.blob(Config.INDEX_PATH)
     if blob.exists():
         blob.download_to_filename(Config.LOCAL_INDEX)
@@ -52,7 +49,6 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
     state.bucket.blob(Config.VAULT_PATH).download_to_filename(Config.LOCAL_VAULT)
     flat_vault_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     
-    # Ensure nprobe depth is applied securely through the IDMap wrapper
     if hasattr(search_engine.state.index, 'index'):
         search_engine.state.index.index.nprobe = nprobe
     elif hasattr(search_engine.state.index, 'nprobe'):
@@ -64,7 +60,6 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
     offsets = []
     current_offset = 0
     
-    # 1. Compile the master query matrix (NO ZERO PADDING)
     for record in test_samples:
         start_r, end_r = int(record['start_row']), int(record['end_row'])
         count = end_r - start_r + 1
@@ -72,13 +67,10 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
             
         real_descriptors = flat_vault_index.reconstruct_n(start_r, count)
         
-        # Cap at max features, but DO NOT pad if under
         if len(real_descriptors) > Config.N_FEATURES:
             real_descriptors = real_descriptors[:Config.N_FEATURES]
             
         query_blocks.append(real_descriptors)
-        
-        # Track the exact start and stop indices for this specific image
         block_length = len(real_descriptors)
         offsets.append((current_offset, current_offset + block_length, record))
         current_offset += block_length
@@ -86,22 +78,16 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
     if not query_blocks:
         return 0.0, 0.0
         
-    # Stack the unpadded blocks into one lean master matrix
     master_query_matrix = np.vstack(query_blocks)
     
-    # 2. Fire the single parallel batch execution
     start_search = time.time()
     D, I = search_engine.state.index.search(master_query_matrix, k=1)
     total_latency_ms = (time.time() - start_search) * 1000
-    
     avg_latency = total_latency_ms / len(offsets)
     
-    # 3. Tally matches using the precise offsets
     correct_matches = 0
     for start_idx, end_idx, record in offsets:
-        # Extract only the exact results belonging to this image
         block_I = I[start_idx:end_idx]
-        
         identity_tally = {}
         for row_idx in block_I.flatten():
             if row_idx in search_engine.row_to_metadata_map:
@@ -131,19 +117,15 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
 def run_scaling_stress_test(state, n_sizes=[10, 50, 100, 250, 500]):
     """Runs the benchmark across scaling input sizes to verify cluster O(1) latency."""
     print("🚀 Initiating N-Size Scaling Test...")
-    accuracies = []
-    latencies = []
+    accuracies, latencies = [], []
 
     for size in n_sizes:
         print(f"🧪 Testing Sample Size: {size}...")
-        # Run silently to avoid spamming the console
         acc, lat = execute_live_notebook_benchmark(state, sample_size=size, verbose=False)
         accuracies.append(acc)
         latencies.append(lat)
 
-    # Plot the scaling results
     fig, ax1 = plt.subplots(figsize=(10, 5))
-
     color = 'tab:red'
     ax1.set_xlabel('Sample Size (N)')
     ax1.set_ylabel('Average Latency (ms)', color=color)
@@ -164,13 +146,12 @@ def run_scaling_stress_test(state, n_sizes=[10, 50, 100, 250, 500]):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. ENVIRONMENTAL STRESS TESTS & VISUALIZATION
+# 3. ENVIRONMENTAL STRESS TESTS & VISUALIZATION (Refactored)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _simulate_wall_photo(img_np):
     """Shrinks the artwork and places it on a randomized, noisy background."""
     h, w = img_np.shape[:2]
-    
     scale = 0.5
     new_w, new_h = int(w * scale), int(h * scale)
     painting = cv2.resize(img_np, (new_w, new_h))
@@ -181,32 +162,26 @@ def _simulate_wall_photo(img_np):
     noise = np.random.randint(-30, 30, (h, w, 3), dtype=np.int16)
     wall = np.clip(wall + noise, 0, 255).astype(np.uint8)
     
-    y_offset = (h - new_h) // 2
-    x_offset = (w - new_w) // 2
+    y_offset, x_offset = (h - new_h) // 2, (w - new_w) // 2
     wall[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = painting
-    
     return wall
 
 
 def _simulate_book_page(img_np):
     """Warps the 2D image over a 3D cylindrical curve with spine shading."""
     h, w = img_np.shape[:2]
-
     x_map, y_map = np.meshgrid(np.arange(w), np.arange(h))
-    x_map = x_map.astype(np.float32)
-    y_map = y_map.astype(np.float32)
+    x_map, y_map = x_map.astype(np.float32), y_map.astype(np.float32)
 
     amplitude = h * 0.05 
     norm_x = x_map / w
-    y_map = y_map - (amplitude * np.sin(norm_x * np.pi))
-    y_map = y_map + amplitude
+    y_map = y_map - (amplitude * np.sin(norm_x * np.pi)) + amplitude
 
-    paper_color = (240, 245, 245)
     warped_page = cv2.remap(
         img_np, x_map, y_map, 
         interpolation=cv2.INTER_LINEAR, 
         borderMode=cv2.BORDER_CONSTANT, 
-        borderValue=paper_color
+        borderValue=(240, 245, 245)
     )
 
     shadow_gradient = 0.4 + 0.6 * np.power(norm_x, 0.6) 
@@ -216,22 +191,80 @@ def _simulate_book_page(img_np):
     bg_color = [random.randint(120, 160) for _ in range(3)]
     desk = np.full((h + int(amplitude*2), w + 40, 3), bg_color, dtype=np.uint8)   
  
-    y_offset = int(amplitude)
-    x_offset = 20
-    desk[y_offset:y_offset+h, x_offset:x_offset+w] = warped_page
-
+    desk[int(amplitude):int(amplitude)+h, 20:20+w] = warped_page
     return desk
+
+
+def _fetch_source_image(state, artwork_id):
+    """Pulls the pristine original image bytes from GCS storage."""
+    try:
+        blob = state.bucket.blob(f"images/{artwork_id}.jpg")
+        img_bytes = blob.download_as_bytes()
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        print(f"⚠️ Failed to fetch {artwork_id}: {e}")
+        return None
+
+
+def _apply_environmental_noise(img_np):
+    """Randomly applies a geometric or textural transformation pipeline."""
+    scenario = random.choice(["Wall", "Book"])
+    if scenario == "Wall":
+        return _simulate_wall_photo(img_np), scenario
+    return _simulate_book_page(img_np), scenario
+
+
+def _recalculate_diagnostic_tally(search_engine, img_np, nprobe):
+    """Helper to expose the raw FAISS vote distribution for failure analysis."""
+    resized = cv2.resize(img_np, Config.RESIZE_DIM)
+    _, des = search_engine.state.orb.detectAndCompute(resized, None)
+    
+    if des is None or len(des) == 0:
+        des = np.zeros((Config.N_FEATURES, 32), dtype=np.uint8)
+    elif len(des) > Config.N_FEATURES:
+        des = des[:Config.N_FEATURES]
+    elif len(des) < Config.N_FEATURES:
+        padding = np.zeros((Config.N_FEATURES - len(des), 32), dtype=np.uint8)
+        des = np.vstack([des, padding])
+        
+    if hasattr(search_engine.state.index, 'index'):
+        search_engine.state.index.index.nprobe = nprobe
+    elif hasattr(search_engine.state.index, 'nprobe'):
+        search_engine.state.index.nprobe = nprobe
+        
+    D, I = search_engine.state.index.search(des, k=1)
+    
+    tally = {}
+    for row_idx in I.flatten():
+        if row_idx in search_engine.row_to_metadata_map:
+            art_id = search_engine.row_to_metadata_map[row_idx]['id']
+            tally[art_id] = tally.get(art_id, 0) + 1
+            
+    return tally
+
+
+def _print_vote_diagnostics(tally, true_id, predicted_id):
+    """Logs a clean leaderboard of the underlying feature votes."""
+    sorted_tally = sorted(tally.items(), key=lambda x: x[1], reverse=True)
+    
+    print(f"\n   🔍 VOTE DISTRIBUTION DIAGNOSTIC:")
+    print(f"   ----------------------------------")
+    print(f"   Expected ID: {true_id} -> {tally.get(true_id, 0)} votes")
+    print(f"   Matched ID:  {predicted_id} -> {tally.get(predicted_id, 0)} votes")
+    print(f"   Top Competitors:")
+    for rank, (art_id, votes) in enumerate(sorted_tally[:5]):
+        marker = "  <-- (TRUE TARGET)" if art_id == true_id else ""
+        print(f"      {rank+1}. {art_id}: {votes} votes{marker}")
+    print(f"   ----------------------------------")
 
 
 def visualize_orb_matches(query_img, match_result, state):
     """Downloads the matched image from GCS and draws the visual point connections."""
     print(f"\n🖼️ Fetching matched asset 'gs://{state.bucket.name}/images/{match_result.artwork_id}.jpg'...")
-    
     try:
-        blob = state.bucket.blob(f"images/{match_result.artwork_id}.jpg")
-        img_bytes = blob.download_as_bytes()
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        matched_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        matched_img = _fetch_source_image(state, match_result.artwork_id)
+        if matched_img is None: return
         
         query_resized = cv2.resize(query_img, Config.RESIZE_DIM)
         match_resized = cv2.resize(matched_img, Config.RESIZE_DIM)
@@ -240,13 +273,10 @@ def visualize_orb_matches(query_img, match_result, state):
         kp2, des2 = state.orb.detectAndCompute(match_resized, None)
         
         bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = bf.match(des1, des2)
-        matches = sorted(matches, key=lambda x: x.distance)
+        matches = sorted(bf.match(des1, des2), key=lambda x: x.distance)
         
         img_matches = cv2.drawMatches(
-            query_resized, kp1, 
-            match_resized, kp2, 
-            matches[:50], None, 
+            query_resized, kp1, match_resized, kp2, matches[:50], None, 
             flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
         )
         
@@ -255,7 +285,6 @@ def visualize_orb_matches(query_img, match_result, state):
         plt.title(f"Match: {match_result.title} by {match_result.artist} | Confidence: {match_result.confidence:.2%}")
         plt.axis('off')
         plt.show()
-        
     except Exception as e:
         print(f"⚠️ Could not render visual match: {e}")
 
@@ -272,8 +301,8 @@ def run_environmental_stress_test(state, sample_size=10, visualize_top_n=3, npro
     
     random.seed(int(time.time()))
     test_samples = random.sample(valid_records, k=sample_size)
-    
     search_engine = ArtSearchEngine(state)
+    
     correct_matches = 0
     latencies = []
     
@@ -281,43 +310,34 @@ def run_environmental_stress_test(state, sample_size=10, visualize_top_n=3, npro
     
     for idx, record in enumerate(test_samples):
         artwork_id = record['id']
+        original_img = _fetch_source_image(state, artwork_id)
         
-        # 1. Fetch the raw original image from GCS
-        try:
-            blob = state.bucket.blob(f"images/{artwork_id}.jpg")
-            img_bytes = blob.download_as_bytes()
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            original_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        except Exception as e:
-            print(f"⚠️ Failed to fetch {artwork_id}: {e}")
+        if original_img is None:
             continue
             
-        # 2. Randomly select an environmental hazard
-        scenario = random.choice(["Wall", "Book"])
-        if scenario == "Wall":
-            mutated_img = _simulate_wall_photo(original_img)
-        else:
-            mutated_img = _simulate_book_page(original_img)
-            
-        # 3. Run the live search engine on the mutated image
+        mutated_img, scenario = _apply_environmental_noise(original_img)
+        
         start_time = time.time()
         result = search_engine.find_match(mutated_img, nprobe=nprobe)
         latencies.append((time.time() - start_time) * 1000)
         
-        # 4. Check accuracy
         is_correct = (result.artwork_id == artwork_id)
         if is_correct:
             correct_matches += 1
             
-        # 5. Render the 3-panel visualizer
-        if idx < visualize_top_n:
+        if idx < visualize_top_n or not is_correct:
             status = "✅ SUCCESS" if is_correct else f"❌ FAILED (Matched: {result.artwork_id})"
             print(f"\n--- Test {idx+1}: {status} [{scenario} Scenario] ---")
             
-            if result.artwork_id != "unknown":
-                visualize_orb_matches(mutated_img, result, state)
-            else:
-                print("Engine returned 'Unknown' - No visual to render.")
+            if not is_correct:
+                tally = _recalculate_diagnostic_tally(search_engine, mutated_img, nprobe)
+                _print_vote_diagnostics(tally, true_id=artwork_id, predicted_id=result.artwork_id)
+            
+            if idx < visualize_top_n:
+                if result.artwork_id != "unknown":
+                    visualize_orb_matches(mutated_img, result, state)
+                else:
+                    print("Engine returned 'Unknown' - No visual to render.")
 
     final_accuracy = (correct_matches / len(test_samples)) * 100 if test_samples else 0.0
     avg_latency = np.mean(latencies) if latencies else 0.0
