@@ -31,7 +31,7 @@ def load_production_brain(state):
 # 2. PURE MATHEMATICAL BENCHMARKS (Speed & Accuracy)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=True):
+def execute_live_notebook_benchmark(state, sample_size=100, nprobe=None, verbose=True):
     """Evaluates system search accuracy and latency using true dynamic C++ matrix batching."""
     df_meta = state.source_df
     if df_meta is None or df_meta.empty:
@@ -49,10 +49,12 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
     state.bucket.blob(Config.VAULT_PATH).download_to_filename(Config.LOCAL_VAULT)
     flat_vault_index = faiss.read_index_binary(Config.LOCAL_VAULT)
     
+    # Use Config default if not explicitly provided
+    active_nprobe = nprobe if nprobe else getattr(Config, 'NPROBE_PRIMARY', 8)
     if hasattr(search_engine.state.index, 'index'):
-        search_engine.state.index.index.nprobe = nprobe
+        search_engine.state.index.index.nprobe = active_nprobe
     elif hasattr(search_engine.state.index, 'nprobe'):
-        search_engine.state.index.nprobe = nprobe
+        search_engine.state.index.nprobe = active_nprobe
         
     if verbose: print(f"🏎️ Benchmark Active: Compiling Dynamic Matrix for {sample_size} samples...")
     
@@ -86,10 +88,16 @@ def execute_live_notebook_benchmark(state, sample_size=100, nprobe=8, verbose=Tr
     avg_latency = total_latency_ms / len(offsets)
     
     correct_matches = 0
+    max_dist = getattr(Config, 'MAX_HAMMING_DISTANCE', 45)
+    
     for start_idx, end_idx, record in offsets:
         block_I = I[start_idx:end_idx]
+        block_D = D[start_idx:end_idx]
         identity_tally = {}
-        for row_idx in block_I.flatten():
+        
+        for dist, row_idx in zip(block_D.flatten(), block_I.flatten()):
+            if dist > max_dist:  # Apply the new garbage-match filter
+                continue
             if row_idx in search_engine.row_to_metadata_map:
                 item = search_engine.row_to_metadata_map[row_idx]
                 identity_tally[item['id']] = identity_tally.get(item['id'], 0) + 1
@@ -215,28 +223,31 @@ def _apply_environmental_noise(img_np):
     return _simulate_book_page(img_np), scenario
 
 
-def _recalculate_diagnostic_tally(search_engine, img_np, nprobe):
-    """Helper to expose the raw FAISS vote distribution for failure analysis."""
+def _recalculate_diagnostic_tally(search_engine, img_np):
+    """Helper to expose the raw FAISS vote distribution. (Zero-padding removed!)"""
     resized = cv2.resize(img_np, Config.RESIZE_DIM)
     _, des = search_engine.state.orb.detectAndCompute(resized, None)
     
     if des is None or len(des) == 0:
-        des = np.zeros((Config.N_FEATURES, 32), dtype=np.uint8)
+        return {}
     elif len(des) > Config.N_FEATURES:
         des = des[:Config.N_FEATURES]
-    elif len(des) < Config.N_FEATURES:
-        padding = np.zeros((Config.N_FEATURES - len(des), 32), dtype=np.uint8)
-        des = np.vstack([des, padding])
         
+    # Use the fallback net to give the most accurate diagnostic picture
+    diagnostic_nprobe = getattr(Config, 'NPROBE_FALLBACK', 64)
     if hasattr(search_engine.state.index, 'index'):
-        search_engine.state.index.index.nprobe = nprobe
+        search_engine.state.index.index.nprobe = diagnostic_nprobe
     elif hasattr(search_engine.state.index, 'nprobe'):
-        search_engine.state.index.nprobe = nprobe
+        search_engine.state.index.nprobe = diagnostic_nprobe
         
     D, I = search_engine.state.index.search(des, k=1)
     
     tally = {}
-    for row_idx in I.flatten():
+    max_dist = getattr(Config, 'MAX_HAMMING_DISTANCE', 45)
+    
+    for dist, row_idx in zip(D.flatten(), I.flatten()):
+        if dist > max_dist:
+            continue
         if row_idx in search_engine.row_to_metadata_map:
             art_id = search_engine.row_to_metadata_map[row_idx]['id']
             tally[art_id] = tally.get(art_id, 0) + 1
@@ -282,14 +293,17 @@ def visualize_orb_matches(query_img, match_result, state):
         
         plt.figure(figsize=(18, 8))
         plt.imshow(cv2.cvtColor(img_matches, cv2.COLOR_BGR2RGB))
-        plt.title(f"Match: {match_result.title} by {match_result.artist} | Confidence: {match_result.confidence:.2%}")
+        title_str = f"Match: {match_result.title} by {match_result.artist} | Confidence: {match_result.confidence:.2%}"
+        if hasattr(match_result, 'fallback_triggered') and match_result.fallback_triggered:
+            title_str += " [Fallback Triggered]"
+        plt.title(title_str)
         plt.axis('off')
         plt.show()
     except Exception as e:
         print(f"⚠️ Could not render visual match: {e}")
 
 
-def run_environmental_stress_test(state, sample_size=10, visualize_top_n=3, nprobe=8):
+def run_environmental_stress_test(state, sample_size=10, visualize_top_n=3):
     """Tests the engine's resilience against non-linear geometric and environmental noise."""
     df_meta = state.source_df
     if df_meta is None or df_meta.empty:
@@ -318,7 +332,7 @@ def run_environmental_stress_test(state, sample_size=10, visualize_top_n=3, npro
         mutated_img, scenario = _apply_environmental_noise(original_img)
         
         start_time = time.time()
-        result = search_engine.find_match(mutated_img, nprobe=nprobe)
+        result = search_engine.find_match(mutated_img)  # <--- nprobe arg completely removed
         latencies.append((time.time() - start_time) * 1000)
         
         is_correct = (result.artwork_id == artwork_id)
@@ -330,7 +344,7 @@ def run_environmental_stress_test(state, sample_size=10, visualize_top_n=3, npro
             print(f"\n--- Test {idx+1}: {status} [{scenario} Scenario] ---")
             
             if not is_correct:
-                tally = _recalculate_diagnostic_tally(search_engine, mutated_img, nprobe)
+                tally = _recalculate_diagnostic_tally(search_engine, mutated_img)
                 _print_vote_diagnostics(tally, true_id=artwork_id, predicted_id=result.artwork_id)
             
             if idx < visualize_top_n:

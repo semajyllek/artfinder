@@ -19,8 +19,12 @@ class Config:
     TIMEOUT          = 10
 
     # search & curation
-    CLUSTERS         = 4096  
-    FUZZY_THRESHOLD  = 90
+    CLUSTERS                   = 4096  
+    FUZZY_THRESHOLD            = 90
+    NPROBE_PRIMARY             = 8       # Tier 1: Fast search (sub 30ms)
+    NPROBE_FALLBACK            = 64      # Tier 2: Wide search for mutated/noisy queries
+    CONFIDENCE_RETRY_THRESHOLD = 0.15    # Trigger fallback if Tier 1 confidence is below 15%
+    MAX_HAMMING_DISTANCE       = 45      # Discard feature matches with > 45 bits difference
 
     # GCS paths
     META_PATH     = "system/source_metadata.parquet"
@@ -43,4 +47,4 @@ class Config:
 
     IMAGE_FIELDNAMES = ["run_id", "timestamp", "n_features", "dimension", "resize_dim", "scale_factor", "n_levels", "wta_k", "vault_size", "clusters", "nprobe", "true_id", "predicted_id", "predicted_title", "predicted_artist", "confidence", "match", "latency_ms"]
     SUMMARY_FIELDNAMES = ["run_id", "timestamp", "n_features", "dimension", "resize_dim", "scale_factor", "n_levels", "wta_k", "vault_size", "clusters", "nprobe", "n_tested", "n_correct", "accuracy", "avg_latency_ms"]
-    CONFIG_KEY_COLS = ("n_features", "dimension", "resize_dim", "scale_factor", "n_levels", "wta_k", "vault_size", "clusters", "nprobe")
+    CONFIG_KEY_COLS = ("n_features", "dimension", "resize_dim", "scale_factor", "n_levels", "wta_k", "vault_size", "clusters", "nprobe");   
