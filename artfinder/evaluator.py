@@ -203,6 +203,85 @@ def _simulate_book_page(img_np):
     return desk
 
 
+def _simulate_aged_print(img_np):
+    """Simulates fading, color shifting, and lighting changes typical of old prints/photos."""
+    # Convert to float32 to prevent clipping math errors
+    img_float = img_np.astype(np.float32)
+    
+    # 1. Apply Color Cast (Usually yellowing/warming for old prints)
+    # OpenCV uses BGR. To warm it, we subtract from Blue, add to Green and Red.
+    b_shift = random.uniform(-30, 0)
+    g_shift = random.uniform(-10, 20)
+    r_shift = random.uniform(10, 40)
+    
+    img_float[:, :, 0] += b_shift
+    img_float[:, :, 1] += g_shift
+    img_float[:, :, 2] += r_shift
+    
+    # 2. Shift Brightness (Simulating dim lighting or underexposure)
+    # Multiplier: < 1.0 darkens, > 1.0 lightens. We'll lean heavily towards dark.
+    brightness_scalar = random.uniform(0.5, 1.1) 
+    img_float = img_float * brightness_scalar
+    
+    # 3. Reduce Contrast (Simulating faded ink or glare)
+    # Pushes all pixel values closer to the image's average color
+    mean = np.mean(img_float)
+    contrast_scalar = random.uniform(0.6, 0.9) # 1.0 is original, 0.6 is highly washed out
+    img_float = (img_float - mean) * contrast_scalar + mean
+    
+    # Add a tiny bit of grain (ISO noise from a camera in a dark room)
+    h, w = img_np.shape[:2]
+    noise = np.random.randint(-15, 15, (h, w, 3), dtype=np.float32)
+    img_float += noise
+    
+    # Clip back to valid color bounds and convert to standard image format
+    aged_print = np.clip(img_float, 0, 255).astype(np.uint8)
+    return aged_print
+
+
+def _simulate_angled_gallery_photo(img_np):
+    """Simulates a photo taken from an off-center angle in a gallery, creating perspective skew."""
+    h, w = img_np.shape[:2]
+    
+    # 1. Define the original 4 corners
+    src_points = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
+    
+    # 2. Randomly squish the corners to simulate an angled camera perspective
+    # We shrink the width/height on one side by 15-25% to force a trapezoid
+    squeeze_factor = random.uniform(0.15, 0.25)
+    
+    direction = random.choice(["left", "right", "up", "down"])
+    if direction == "right": # Standing to the left, looking right (right side is smaller/further)
+        dst_points = np.float32([[0, 0], [w, h*squeeze_factor], [0, h], [w, h*(1-squeeze_factor)]])
+    elif direction == "left": # Standing to the right, looking left
+        dst_points = np.float32([[0, h*squeeze_factor], [w, 0], [0, h*(1-squeeze_factor)], [w, h]])
+    elif direction == "up": # Looking up at a tall painting
+        dst_points = np.float32([[w*squeeze_factor, 0], [w*(1-squeeze_factor), 0], [0, h], [w, h]])
+    else: # Looking down
+        dst_points = np.float32([[0, 0], [w, 0], [w*squeeze_factor, h], [w*(1-squeeze_factor), h]])
+
+    # 3. Apply the perspective warp
+    matrix = cv2.getPerspectiveTransform(src_points, dst_points)
+    warped_img = cv2.warpPerspective(img_np, matrix, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30))
+    
+    # 4. Add a subtle museum "spotlight" gradient
+    # Creates a soft radial glow in the center that fades to shadow at the edges
+    y_map, x_map = np.ogrid[:h, :w]
+    center_y, center_x = h // 2, w // 2
+    dist_from_center = np.sqrt((x_map - center_x)**2 + (y_map - center_y)**2)
+    max_dist = np.sqrt(center_x**2 + center_y**2)
+    
+    # Gradient goes from 1.1 (bright center) to 0.6 (dark edges)
+    gradient = 1.1 - 0.5 * (dist_from_center / max_dist)
+    gradient = np.clip(gradient, 0, 1.5)[:, :, np.newaxis]
+    
+    gallery_photo = np.clip(warped_img * gradient, 0, 255).astype(np.uint8)
+    
+    return gallery_photo
+
+
+
+
 def _fetch_source_image(state, artwork_id):
     """Pulls the pristine original image bytes from GCS storage."""
     try:
@@ -217,10 +296,14 @@ def _fetch_source_image(state, artwork_id):
 
 def _apply_environmental_noise(img_np):
     """Randomly applies a geometric or textural transformation pipeline."""
-    scenario = random.choice(["Wall", "Book"])
+    scenario = random.choice(["Wall", "Book", "Aged Print"])
+    
     if scenario == "Wall":
         return _simulate_wall_photo(img_np), scenario
-    return _simulate_book_page(img_np), scenario
+    elif scenario == "Book":
+        return _simulate_book_page(img_np), scenario
+    else:
+        return _simulate_aged_print(img_np), scenario
 
 
 def _recalculate_diagnostic_tally(search_engine, img_np):
