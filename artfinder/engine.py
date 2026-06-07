@@ -1,169 +1,120 @@
-import faiss
+import cv2
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
+from io import BytesIO
 from datasets import load_dataset
-from .config import Config
-from .evaluator import load_production_brain
-from .vault.builder import save_source_metadata, process_image
+import imret
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. CORE PIPELINE FUNCTIONS (The Atomic Steps)
-# ──────────────────────────────────────────────────────────────────────────────
+from .wikiart import wikiart_image_first_generator
 
-def _get_starting_state(state, is_rebuild=False):
-    """Returns the starting Flat Vault, Metadata, and known IDs."""
-    if is_rebuild:
-        print("🧹 REBUILD MODE: Initializing blank slate...")
-        # 1. Purge GCS (Keep it clean!)
-        blobs = state.bucket.list_blobs(prefix="images/")
-        for blob in blobs: blob.delete()
-        
-        # 2. Create Empty States
-        flat_vault = faiss.IndexBinaryFlat(256)
-        df_meta = pd.DataFrame(columns=['id', 'artist', 'title', 'start_row', 'end_row'])
-        return flat_vault, df_meta, set()
-    else:
-        print("📦 APPEND MODE: Downloading existing Flat Vault & Metadata...")
-        load_production_brain(state)
-        state.bucket.blob(Config.VAULT_PATH).download_to_filename(Config.LOCAL_VAULT)
-        
-        flat_vault = faiss.read_index_binary(Config.LOCAL_VAULT)
-        df_meta = state.source_df if state.source_df is not None else pd.DataFrame()
-        existing_ids = set(df_meta['id'].tolist()) if not df_meta.empty else set()
-        
-        print(f"   • Current Vault Vectors: {flat_vault.ntotal:,}")
-        return flat_vault, df_meta, existing_ids
+BRAIN_PREFIX = "production_brain"
+BRAIN_EXTENSIONS = (".faiss", ".meta")
 
 
-def _extract_source_features(state, limit, existing_ids, current_total_rows):
-    """Streams the dataset, extracts ORB features, and tracks matrix offsets."""
-    print(f"📥 Extracting features (Target: {limit} new unique records)...")
-    dataset = load_dataset("huggan/wikiart", split="train", streaming=True)
-    
-    new_vectors = []
-    new_metadata_records = []
-    processed_count = 0
-    
-    for item in tqdm(dataset, total=limit, desc="Extracting"):
-        if processed_count >= limit:
-            break
-            
-        artwork_id = item.get('id', str(hash(item['image'].tobytes())))
-        
-        if artwork_id in existing_ids:
+# ── GCS: brain transport ──────────────────────────────────────────────
+
+def _sync_brain_to_cloud(state, prefix=BRAIN_PREFIX):
+    for ext in BRAIN_EXTENSIONS:
+        state.bucket.blob(f"system/{prefix}{ext}").upload_from_filename(f"{prefix}{ext}")
+
+
+def _download_brain_from_cloud(state, prefix=BRAIN_PREFIX):
+    for ext in BRAIN_EXTENSIONS:
+        state.bucket.blob(f"system/{prefix}{ext}").download_to_filename(f"{prefix}{ext}")
+
+
+# ── GCS: image asset helpers ──────────────────────────────────────────
+
+def _purge_images(state):
+    for blob in state.bucket.list_blobs(prefix="images/"):
+        blob.delete()
+
+
+def _fetch_known_ids(state):
+    """IDs of artworks already stored in GCS, e.g. {'wikiart_12', ...}."""
+    blobs = state.bucket.list_blobs(prefix="images/")
+    return {blob.name.split("/")[-1].removesuffix(".jpg") for blob in blobs}
+
+
+def _upload_image(state, image, visual_id):
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=85)
+    blob = state.bucket.blob(f"images/{visual_id}.jpg")
+    blob.upload_from_string(buffer.getvalue(), content_type="image/jpeg")
+
+
+# ── Ingestion primitives ──────────────────────────────────────────────
+
+def _open_stream(authority_set):
+    raw = load_dataset("huggan/wikiart", split="train", streaming=True)
+    labels = raw.info.features["artist"].names
+    authority = authority_set if authority_set is not None else set()
+    return wikiart_image_first_generator(raw, labels, authority)
+
+
+def _to_grayscale(pil_image):
+    rgb = np.array(pil_image.convert("RGB"))
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+
+def _ingest_item(state, item):
+    """Add one artwork's vector to the vault and store its image in GCS."""
+    state.vault.add(_to_grayscale(item["image"]), item["artist"])
+    _upload_image(state, item["image"], item["visual_id"])
+
+
+def _ingest_stream(state, stream, limit, skip_ids=frozenset()):
+    """Consume the stream, ingesting new items until `limit` is hit. Returns count."""
+    count = 0
+    for item in stream:
+        if item["visual_id"] in skip_ids:
             continue
-            
-        image = item['image'].convert('RGB')
-        vectors = process_image(image, state.orb)
-        
-        if vectors is not None and len(vectors) > 0:
-            start_row = current_total_rows + len(new_vectors)
-            end_row = start_row + len(vectors) - 1
-            
-            new_vectors.extend(vectors)
-            new_metadata_records.append({
-                'id': artwork_id,
-                'artist': item.get('artist', 'Unknown'),
-                'title': item.get('title', 'Unknown'),
-                'start_row': start_row,
-                'end_row': end_row
-            })
-            
-            # Optional: Save original image to GCS for the 3-Panel Visualizer
-            img_blob = state.bucket.blob(f"images/{artwork_id}.jpg")
-            if not img_blob.exists():
-                image.save("temp.jpg", format="JPEG", quality=85)
-                img_blob.upload_from_filename("temp.jpg")
-                
-            processed_count += 1
-            
-    return new_vectors, new_metadata_records
+        if count >= limit:
+            break
+        _ingest_item(state, item)
+        count += 1
+        if count % 100 == 0:
+            print(f"Ingested {count} / {limit} artworks...")
+    return count
 
 
-def _commit_raw_storage(state, flat_vault, df_meta, new_vectors, new_records):
-    """Appends data to the raw Vault and Parquet, then uploads to GCS."""
-    print("\n💾 Committing new data to Raw Storage...")
-    
-    # Update Flat Vault
-    matrix_to_add = np.array(new_vectors, dtype=np.uint8)
-    flat_vault.add(matrix_to_add)
-    faiss.write_index_binary(flat_vault, Config.LOCAL_VAULT)
-    state.bucket.blob(Config.VAULT_PATH).upload_from_filename(Config.LOCAL_VAULT)
-    print(f"   • Updated Vault Vectors: {flat_vault.ntotal:,}")
-    
-    # Update Metadata
-    new_df = pd.DataFrame(new_records)
-    updated_df = pd.concat([df_meta, new_df], ignore_index=True) if not df_meta.empty else new_df
-    save_source_metadata(updated_df, state.bucket)
-    
-    # 🌟 ADD THIS LINE: Keep live memory synchronized with what we just saved!
-    state.source_df = updated_df 
-    
-    return flat_vault
+def _finalize(state):
+    """Re-cluster and persist locally + to cloud. Idempotent to call repeatedly."""
+    print("\n🧠 Building Voronoi clusters natively in C++...")
+    state.vault.build()
+    state.vault.save(BRAIN_PREFIX)
+    _sync_brain_to_cloud(state)
 
 
-def _train_production_brain(state, flat_vault):
-    """Rebuilds the fast IVF search clusters from the master Flat Vault."""
-    print("\n🧠 Retraining the IVF Cluster Brain...")
-    
-    total_vectors = flat_vault.ntotal
-    master_matrix = flat_vault.reconstruct_n(0, total_vectors)
-    
-    # Dynamic Voronoi Math (Scales clusters based on dataset size)
-    nlist = max(100, int(4 * np.sqrt(total_vectors))) 
-    
-    quantizer = faiss.IndexBinaryFlat(256)
-    new_ivf_index = faiss.IndexBinaryIVF(quantizer, 256, nlist)
-    
-    print(f"   • Training {nlist} Voronoi centroids...")
-    new_ivf_index.train(master_matrix)
-    
-    print("   • Injecting explicit row coordinates...")
-    row_ids = np.arange(total_vectors)
-    new_ivf_index.add_with_ids(master_matrix, row_ids)
-    
-    print("📤 Uploading new Production Brain to GCS...")
-    faiss.write_index_binary(new_ivf_index, Config.LOCAL_INDEX)
-    state.bucket.blob(Config.INDEX_PATH).upload_from_filename(Config.LOCAL_INDEX)
-    
-    state.index = new_ivf_index
-    print("✅ Brain successfully trained and deployed!")
+# ── Orchestrators ─────────────────────────────────────────────────────
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. THE IDEMPOTENT ORCHESTRATORS (Your 1-Line Commands)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def run_incremental_update(state, limit=1000):
-    """Appends new unique images to the existing engine and retrains the clusters."""
-    print(f"🚀 --- STARTING INCREMENTAL UPDATE (Limit: {limit}) --- 🚀\n")
-    
-    flat_vault, df_meta, existing_ids = _get_starting_state(state, is_rebuild=False)
-    
-    new_vecs, new_recs = _extract_source_features(state, limit, existing_ids, current_total_rows=flat_vault.ntotal)
-    
-    if not new_vecs:
-        print("\n⚠️ No new unique records found. Engine is already up to date.")
-        return
-        
-    updated_vault = _commit_raw_storage(state, flat_vault, df_meta, new_vecs, new_recs)
-    _train_production_brain(state, updated_vault)
-    print("\n🏆 --- INCREMENTAL UPDATE COMPLETE --- 🏆")
-
-
-def run_complete_rebuild(state, limit=1000):
-    """Wipes the database entirely and builds a fresh engine from scratch."""
+def run_complete_rebuild(state, limit=1000, authority_set=None):
+    """Wipe everything and build a fresh engine from scratch."""
     print(f"⚠️ --- STARTING COMPLETE REBUILD (Limit: {limit}) --- ⚠️\n")
-    
-    flat_vault, df_meta, existing_ids = _get_starting_state(state, is_rebuild=True)
-    
-    new_vecs, new_recs = _extract_source_features(state, limit, existing_ids, current_total_rows=0)
-    
-    if not new_vecs:
-        print("\n⚠️ Failed to extract any features. Rebuild aborted.")
-        return
-        
-    updated_vault = _commit_raw_storage(state, flat_vault, df_meta, new_vecs, new_recs)
-    _train_production_brain(state, updated_vault)
+    _purge_images(state)
+
+    stream = _open_stream(authority_set)
+    _ingest_stream(state, stream, limit)
+
+    _finalize(state)
     print("\n🏆 --- COMPLETE REBUILD SUCCESSFUL --- 🏆")
+
+
+def run_incremental_update(state, limit=1000, authority_set=None):
+    """Append only new unique artworks, validating against what's already in GCS."""
+    print(f"🚀 --- STARTING INCREMENTAL UPDATE (Limit: {limit}) --- 🚀\n")
+
+    _download_brain_from_cloud(state)
+    state.vault = imret.Vault.load_from_disk(BRAIN_PREFIX)
+
+    known_ids = _fetch_known_ids(state)
+    print(f"   • Found {len(known_ids):,} existing artworks in the database.")
+
+    stream = _open_stream(authority_set)
+    added = _ingest_stream(state, stream, limit, skip_ids=known_ids)
+
+    if added == 0:
+        print("\n⚠️ No new unique artworks found. System is fully up to date.")
+        return
+
+    _finalize(state)
+    print("\n🏆 --- INCREMENTAL UPDATE COMPLETE --- 🏆")
