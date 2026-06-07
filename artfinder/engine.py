@@ -4,7 +4,7 @@ from io import BytesIO
 from datasets import load_dataset
 import imret
 
-from .wikiart import wikiart_image_first_generator
+from .intake.wikiart import wikiart_image_first_generator
 
 BRAIN_PREFIX = "production_brain"
 BRAIN_EXTENSIONS = (".faiss", ".meta")
