@@ -113,6 +113,16 @@ print(result.artwork_id, result.title, result.artist, result.confidence)
 
 `find_match()` returns a `SearchResult` with fields: `artwork_id`, `title`, `artist`, `source_url`, `confidence`, `latency_ms`, `fallback_triggered`.
 
+### Diagnostics
+
+```python
+from artfinder.utils import print_engine_diagnostics
+
+print_engine_diagnostics(state)
+```
+
+Prints a summary of the loaded state: paintings ingested, unique artists, total feature vectors, IVF cluster count, and whether the index is built. All stats are O(1) reads from in-memory structures.
+
 ### Benchmarks
 
 ```python
@@ -138,7 +148,7 @@ artfinder/
 ├── evaluator.py       # benchmarks, stress tests, visualizations
 ├── searcher.py        # ArtSearchEngine — search + metadata lookup
 ├── state.py           # SearchEngineState dataclass
-├── utils.py           # diagnostics
+├── utils.py           # print_engine_diagnostics
 ├── intake/
 │   ├── wikiart.py     # WikiArt stream parser and schema transform
 │   └── matcher.py     # fuzzy artist name matching
