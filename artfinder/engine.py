@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import queue
+import threading
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
@@ -82,7 +84,7 @@ def _flush_batch(state, batch):
     images = [_to_grayscale(item["image"]) for item in batch]
     ids    = [item["visual_id"] for item in batch]
     state.vault.add_batch(images, ids)
-    with ThreadPoolExecutor() as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:
         list(ex.map(lambda item: _upload_image(state, item["image"], item["visual_id"]), batch))
     new_rows = pd.DataFrame([{
         'id':     item["visual_id"],
@@ -93,13 +95,36 @@ def _flush_batch(state, batch):
     state.source_df = pd.concat([state.source_df, new_rows], ignore_index=True)
 
 
+_PREFETCH_SIZE = 2 * _BATCH_SIZE  # items buffered ahead of the main thread
+_SENTINEL = object()
+
+
 def _ingest_stream(state, stream, limit, skip_ids=frozenset()):
+    q = queue.Queue(maxsize=_PREFETCH_SIZE)
+
+    def _producer():
+        try:
+            count = 0
+            for item in stream:
+                if item["visual_id"] in skip_ids:
+                    continue
+                if count >= limit:
+                    break
+                q.put(item)
+                count += 1
+        except Exception:
+            logger.exception("Prefetch producer failed")
+        finally:
+            q.put(_SENTINEL)
+
+    producer = threading.Thread(target=_producer, daemon=True)
+    producer.start()
+
     count = 0
     batch = []
-    for item in stream:
-        if item["visual_id"] in skip_ids:
-            continue
-        if count >= limit:
+    while True:
+        item = q.get()
+        if item is _SENTINEL:
             break
         batch.append(item)
         count += 1
@@ -108,8 +133,11 @@ def _ingest_stream(state, stream, limit, skip_ids=frozenset()):
             batch = []
             if count % 100 == 0:
                 logger.info("Ingested %d / %d artworks...", count, limit)
+
     if batch:
         _flush_batch(state, batch)
+
+    producer.join()
     return count
 
 
