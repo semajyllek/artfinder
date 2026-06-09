@@ -180,7 +180,23 @@ def _finalize(state):
 
 # ── Orchestrators ─────────────────────────────────────────────────────
 
+def _ensure_logging():
+    """Configure INFO-level logging to stdout if the caller hasn't already.
+
+    Colab / the HuggingFace `datasets` library can attach a root handler at
+    WARNING before this runs, which would otherwise silently swallow our
+    [ingest]/[build]/[save]/[gcs] progress logs.
+    """
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+    elif root.level > logging.INFO:
+        root.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
+
+
 def run_complete_rebuild(state, limit=1000, authority_set=None, orb_config=None):
+    _ensure_logging()
     logger.info("--- STARTING COMPLETE REBUILD (Limit: %d) ---", limit)
     _purge_images(state)
 
@@ -195,6 +211,7 @@ def run_complete_rebuild(state, limit=1000, authority_set=None, orb_config=None)
 
 
 def run_incremental_update(state, limit=1000, authority_set=None, orb_config=None):
+    _ensure_logging()
     logger.info("--- STARTING INCREMENTAL UPDATE (Limit: %d) ---", limit)
 
     _download_brain_from_cloud(state)
