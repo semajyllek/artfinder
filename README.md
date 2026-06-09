@@ -16,6 +16,15 @@ artfinder is a visual art search system. It ingests paintings from the [WikiArt 
 pip install -r requirements.txt
 ```
 
+## Running tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+The test suite covers the query transforms and the evaluation loop. It requires no GCS credentials — `run_evaluation` itself is integration-level and run manually against a live vault.
+
 The `requirements.txt` includes `imret`. See the [imret README](https://github.com/semajyllek/imret) for build/install instructions if imret is not yet available on PyPI.
 
 The GCS pipeline requires a Google Cloud project and service account credentials with read/write access to the storage bucket. Set the standard `GOOGLE_APPLICATION_CREDENTIALS` environment variable before running.
@@ -65,23 +74,40 @@ You can also pass an authority set directly to either orchestrator to override t
 run_complete_rebuild(state, limit=5000, authority_set={"Rembrandt", "Vermeer", "Caravaggio"})
 ```
 
-## Local evaluation (no GCS required)
+## Evaluation
 
-`evaluate.py` is a self-contained script that streams WikiArt directly from HuggingFace, ingests into an in-process vault, and evaluates retrieval accuracy.
+`evaluate.py` evaluates a **pre-built vault** — ingestion and evaluation are separate concerns. The script downloads a random sample of images from GCS (the same images that were ingested), applies a query transform, searches the vault, and reports accuracy and latency.
+
+Build the vault first using `run_complete_rebuild` or `run_incremental_update`, then evaluate:
 
 ```bash
-python evaluate.py --ingest 2000 --eval 200 --visualize 3
+python evaluate.py --n 100 --transform wall
+python evaluate.py --n 200 --transform all --visualize -1 --results-dir results/
+```
+
+In a Colab notebook:
+
+```python
+# Cell 1 — build (run once)
+from artfinder.engine import run_complete_rebuild
+run_complete_rebuild(state, limit=1000)
+
+# Cell 2 — evaluate (run any time)
+from evaluate import run_evaluation
+run_evaluation(state, n=100, transform="random", visualize=-1, display=True)
 ```
 
 | Flag | Default | Description |
 |---|---|---|
-| `--ingest N` | 500 | Number of images to ingest |
-| `--eval N` | 100 | Number of images to evaluate accuracy on |
-| `--batch N` | 64 | Batch size for `add_batch()` calls |
-| `--vault PATH` | `/tmp/imret_wikiart_eval` | File prefix for save/load roundtrip test |
-| `--visualize N` | 0 | Save RANSAC keypoint match visualizations for the first N correct results |
+| `--n N` | 100 | Number of images to sample from GCS |
+| `--transform` | `random` | `none` / `affine` / `perspective` / `book` / `wall` / `random` / `all` |
+| `--visualize N` | 0 | Visualizations to save/display; `-1` = all |
+| `--results-dir PATH` | — | Directory for summary txt and visualizations |
+| `--seed N` | 42 | Random seed for image sampling |
 
-The script evaluates accuracy by searching with the same images that were ingested, reports accuracy, fallback rate, average and p95 latency, ingest speed, and build time. Visualizations are saved to `/tmp/imret_match_N.png`.
+`random` transform samples uniformly across the four real transforms (affine, perspective, book, wall), giving an unbiased accuracy estimate over all conditions.
+
+Visualizations show a trio: transformed query | RANSAC keypoint match | original image. MATCH results are captioned in green, failures in red.
 
 ## Production pipeline
 
@@ -183,16 +209,16 @@ Evaluated on WikiArt images using `evaluate.py` — 100 randomly selected re-que
 
 Visualizations (keypoint match images for all 100 queries per vault size, labelled MATCH or FAIL) are saved to `results/` which is gitignored.
 
-To reproduce:
+To reproduce (vault must already be built via `run_complete_rebuild`):
 
 ```bash
-python evaluate.py --ingest 1000 --eval 100 --visualize -1 --results-dir results/n1000
+python evaluate.py --n 100 --visualize -1 --results-dir results/n1000
 ```
 
 To evaluate all transform modes:
 
 ```bash
-python evaluate.py --ingest 1000 --eval 100 --transform all
+python evaluate.py --n 100 --transform all
 ```
 
 ## Directory structure
