@@ -123,11 +123,11 @@ def _finalize(state):
 
 # ── Orchestrators ─────────────────────────────────────────────────────
 
-def run_complete_rebuild(state, limit=1000, authority_set=None):
+def run_complete_rebuild(state, limit=1000, authority_set=None, orb_config=None):
     logger.info("--- STARTING COMPLETE REBUILD (Limit: %d) ---", limit)
     _purge_images(state)
 
-    state.vault = imret.Vault(create_orb_config())
+    state.vault = imret.Vault(orb_config or create_orb_config())
     state.source_df = pd.DataFrame(columns=['id', 'title', 'artist', 'url'])
 
     stream = _open_stream(authority_set)
@@ -137,11 +137,11 @@ def run_complete_rebuild(state, limit=1000, authority_set=None):
     logger.info("--- COMPLETE REBUILD SUCCESSFUL ---")
 
 
-def run_incremental_update(state, limit=1000, authority_set=None):
+def run_incremental_update(state, limit=1000, authority_set=None, orb_config=None):
     logger.info("--- STARTING INCREMENTAL UPDATE (Limit: %d) ---", limit)
 
     _download_brain_from_cloud(state)
-    state.vault = imret.Vault.load_from_disk(BRAIN_PREFIX, create_orb_config())
+    state.vault = imret.Vault.load_from_disk(BRAIN_PREFIX, orb_config or create_orb_config())
     state.source_df = load_source_metadata(state.bucket)
 
     known_ids = _fetch_known_ids(state)
