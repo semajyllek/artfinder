@@ -1,2 +1,7 @@
-.DS_Store
-artfinder/.DS_Store
+**/.DS_Store
+results/
+__pycache__/
+*.pyc
+*.parquet
+*.faiss
+*.meta

@@ -171,6 +171,30 @@ run_scaling_stress_test(state, n_sizes=[10, 50, 100, 250, 500])
 run_environmental_stress_test(state, sample_size=50, visualize_top_n=3)
 ```
 
+## Evaluation results
+
+Evaluated on WikiArt images using `evaluate.py` — 100 randomly selected re-queries per vault size, `transform=none`, macOS arm64, `max_features=500`, `resize_dim=800`.
+
+| Vault size | Accuracy | Avg latency (ms) | p95 latency (ms) | Fallback rate | Build time (s) |
+|---|---|---|---|---|---|
+| 100 | 100/100 (100.0%) | 10.51 | 15.35 | 0.0% | 1.4 |
+| 1,000 | 100/100 (100.0%) | 10.79 | 15.20 | 0.0% | 37.3 |
+| 10,000 | 100/100 (100.0%) | 14.17 | 25.65 | 0.0% | 95.3 |
+
+Visualizations (keypoint match images for all 100 queries per vault size, labelled MATCH or FAIL) are saved to `results/` which is gitignored.
+
+To reproduce:
+
+```bash
+python evaluate.py --ingest 1000 --eval 100 --visualize -1 --results-dir results/n1000
+```
+
+To evaluate all transform modes:
+
+```bash
+python evaluate.py --ingest 1000 --eval 100 --transform all
+```
+
 ## Directory structure
 
 ```
