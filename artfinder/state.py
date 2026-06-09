@@ -1,12 +1,13 @@
-import cv2
+from dataclasses import dataclass, field
 from google.cloud import storage
-from dataclasses import dataclass
+import imret
+import pandas as pd
+
 
 @dataclass
 class SearchEngineState:
-    """Maintains active system configurations and bucket states."""
+    """Maintains active system configurations and bucket state."""
     client: storage.Client
     bucket: storage.Bucket
-    orb: cv2.Feature2D
-    index: object = None
-    source_df: object = None
+    vault: imret.Vault = None
+    source_df: pd.DataFrame = None
