@@ -47,6 +47,24 @@ cfg.max_hamming_distance = 45
 cfg.confidence_threshold = 0.15
 ```
 
+## Authority set
+
+The authority set controls which artists are ingested. It is a list of canonical artist names stored in `data/artist_authority.json`. Only images whose artist name matches an entry in this list are ingested; when the file is absent or empty, all artists are ingested.
+
+The default authority set (968 artists) was generated from Wikidata using sitelinks as a proxy for significance:
+
+```bash
+python generate_authority_set.py --limit 1000 --out data/artist_authority.json
+```
+
+To regenerate or expand it, adjust `--limit`. The script requires the `requests` package. The output is a sorted JSON array of strings.
+
+You can also pass an authority set directly to either orchestrator to override the file:
+
+```python
+run_complete_rebuild(state, limit=5000, authority_set={"Rembrandt", "Vermeer", "Caravaggio"})
+```
+
 ## Local evaluation (no GCS required)
 
 `evaluate.py` is a self-contained script that streams WikiArt directly from HuggingFace, ingests into an in-process vault, and evaluates retrieval accuracy.
@@ -85,6 +103,18 @@ state  = SearchEngineState(client=client, bucket=bucket)
 run_complete_rebuild(state, limit=10000)
 ```
 
+Pass `orb_config` to override the default imret parameters for this run:
+
+```python
+import imret
+
+cfg = imret.OrbConfig()
+cfg.max_features = 1000
+cfg.resize_dim   = 1024
+
+run_complete_rebuild(state, limit=10000, orb_config=cfg)
+```
+
 ### Incremental update
 
 Downloads the existing vault from GCS, ingests only images not already present, rebuilds the index, and re-uploads.
@@ -94,6 +124,8 @@ from artfinder.engine import run_incremental_update
 
 run_incremental_update(state, limit=1000)
 ```
+
+`orb_config` is accepted here too. If omitted, the config stored in the vault's `.meta` file is used.
 
 ### Searching
 
@@ -154,5 +186,8 @@ artfinder/
 │   └── matcher.py     # fuzzy artist name matching
 └── vault/
     └── builder.py     # GCS metadata parquet loader
-evaluate.py            # standalone local evaluation script
+data/
+└── artist_authority.json   # curated artist name list (968 entries)
+evaluate.py                 # standalone local evaluation script
+generate_authority_set.py   # regenerate artist_authority.json from Wikidata
 ```

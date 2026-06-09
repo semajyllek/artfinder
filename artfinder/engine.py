@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
 import pandas as pd
@@ -81,8 +82,8 @@ def _flush_batch(state, batch):
     images = [_to_grayscale(item["image"]) for item in batch]
     ids    = [item["visual_id"] for item in batch]
     state.vault.add_batch(images, ids)
-    for item in batch:
-        _upload_image(state, item["image"], item["visual_id"])
+    with ThreadPoolExecutor() as ex:
+        list(ex.map(lambda item: _upload_image(state, item["image"], item["visual_id"]), batch))
     new_rows = pd.DataFrame([{
         'id':     item["visual_id"],
         'title':  item.get("title", ""),
