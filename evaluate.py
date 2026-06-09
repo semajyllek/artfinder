@@ -78,7 +78,57 @@ def _wall_photo(gray: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return canvas
 
 
-_REAL_TRANSFORMS = [_affine_jitter, _perspective_warp, _book_page, _wall_photo]
+def _brightness_shift(gray: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Gamma correction — simulates darker or lighter viewing conditions."""
+    gamma = float(rng.uniform(0.35, 2.0))
+    table = np.clip((np.arange(256) / 255.0) ** gamma * 255.0, 0, 255).astype(np.uint8)
+    return cv2.LUT(gray, table)
+
+
+def _spine_warp(gray: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Sinusoidal compression + perspective tilt + shadow gradient — bending book page at an angle."""
+    h, w = gray.shape
+
+    # Perspective tilt: one side foreshortened (spine side)
+    tilt = float(rng.uniform(0.10, 0.25))
+    src = np.float32([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]])
+    dst = np.float32([
+        [w * tilt,         0],
+        [w - 1,            0],
+        [w - 1,            h - 1],
+        [w * tilt * 0.5,   h - 1],
+    ])
+    tilted = cv2.warpPerspective(gray, cv2.getPerspectiveTransform(src, dst), (w, h))
+
+    # Sinusoidal horizontal compression (the actual page curve)
+    curvature = float(rng.uniform(0.15, 0.35))
+    t     = np.linspace(0, 1, w, dtype=np.float32)
+    x_src = np.clip((w - 1) * (t + curvature * np.sin(np.pi * t)), 0, w - 1)
+    map_x = np.tile(x_src, (h, 1))
+    map_y = np.tile(np.arange(h, dtype=np.float32).reshape(-1, 1), (1, w))
+    curved = cv2.remap(tilted, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+
+    # Shadow gradient (darker on the spine side)
+    shadow = np.linspace(0.55, 1.0, w, dtype=np.float32)
+    return np.clip(curved.astype(np.float32) * shadow[np.newaxis, :], 0, 255).astype(np.uint8)
+
+
+def _contrast_shift(gray: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Contrast + brightness offset — simulates different camera exposure or color temperature."""
+    alpha = float(rng.uniform(0.5, 1.6))
+    beta  = int(rng.integers(-50, 51))
+    return cv2.convertScaleAbs(gray, alpha=alpha, beta=beta)
+
+
+_REAL_TRANSFORMS = [
+    _affine_jitter,
+    _perspective_warp,
+    _book_page,
+    _wall_photo,
+    _brightness_shift,
+    _spine_warp,
+    _contrast_shift,
+]
 
 def _random_transform(gray: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return _REAL_TRANSFORMS[rng.integers(len(_REAL_TRANSFORMS))](gray, rng)
@@ -89,6 +139,9 @@ TRANSFORMS = {
     "perspective": _perspective_warp,
     "book":        _book_page,
     "wall":        _wall_photo,
+    "brightness":  _brightness_shift,
+    "spine":       _spine_warp,
+    "contrast":    _contrast_shift,
     "random":      _random_transform,
 }
 

@@ -20,6 +20,9 @@ from evaluate import (
     _perspective_warp,
     _book_page,
     _wall_photo,
+    _brightness_shift,
+    _spine_warp,
+    _contrast_shift,
     _random_transform,
     _REAL_TRANSFORMS,
 )
@@ -61,6 +64,9 @@ def test_eval_config_defaults():
     ("perspective",  _perspective_warp),
     ("book",         _book_page),
     ("wall",         _wall_photo),
+    ("brightness",   _brightness_shift),
+    ("spine",        _spine_warp),
+    ("contrast",     _contrast_shift),
     ("random",       _random_transform),
 ])
 def test_transform_output_is_uint8_2d(name, fn):
@@ -73,6 +79,9 @@ def test_transform_output_is_uint8_2d(name, fn):
 @pytest.mark.parametrize("name,fn", [
     ("affine",       _affine_jitter),
     ("perspective",  _perspective_warp),
+    ("brightness",   _brightness_shift),
+    ("spine",        _spine_warp),
+    ("contrast",     _contrast_shift),
 ])
 def test_transform_preserves_shape(name, fn):
     img = _gray(300, 200)
@@ -98,11 +107,12 @@ def test_none_transform_is_identity():
 
 
 def test_random_transform_uses_real_transforms():
-    """random must delegate to one of the four real transforms."""
+    """random must delegate to one of the real transforms."""
     called = []
+    n = len(_REAL_TRANSFORMS)
     patched = [
         lambda g, rng, i=i: (called.append(i), g)[1]
-        for i in range(4)
+        for i in range(n)
     ]
     orig = _REAL_TRANSFORMS[:]
     try:
@@ -110,9 +120,13 @@ def test_random_transform_uses_real_transforms():
         img = _gray()
         _random_transform(img, _rng())
         assert len(called) == 1
-        assert called[0] in range(4)
+        assert called[0] in range(n)
     finally:
         _REAL_TRANSFORMS[:] = orig
+
+
+def test_real_transforms_count():
+    assert len(_REAL_TRANSFORMS) == 7
 
 
 # ── _run_eval_loop ────────────────────────────────────────────────────

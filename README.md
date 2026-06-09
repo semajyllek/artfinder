@@ -100,12 +100,24 @@ run_evaluation(state, n=100, transform="random", visualize=-1, display=True)
 | Flag | Default | Description |
 |---|---|---|
 | `--n N` | 100 | Number of images to sample from GCS |
-| `--transform` | `random` | `none` / `affine` / `perspective` / `book` / `wall` / `random` / `all` |
+| `--transform` | `random` | `none` / `affine` / `perspective` / `book` / `wall` / `brightness` / `spine` / `contrast` / `random` / `all` |
 | `--visualize N` | 0 | Visualizations to save/display; `-1` = all |
 | `--results-dir PATH` | — | Directory for summary txt and visualizations |
 | `--seed N` | 42 | Random seed for image sampling |
 
-`random` transform samples uniformly across the four real transforms (affine, perspective, book, wall), giving an unbiased accuracy estimate over all conditions.
+Transforms:
+
+| Name | Simulates |
+|---|---|
+| `affine` | Rotation + scale jitter |
+| `perspective` | Camera angle / corner warp |
+| `book` | Perspective warp + cream page border |
+| `wall` | Perspective warp + grey wall border + blur |
+| `brightness` | Darker or lighter viewing conditions (gamma) |
+| `spine` | Image printed across a bending book page at an angle (curve + tilt + shadow gradient) |
+| `contrast` | Different camera exposure / color temperature (contrast + brightness offset) |
+
+`random` samples uniformly across all seven real transforms, giving an unbiased accuracy estimate over all conditions.
 
 Visualizations show a trio: transformed query | RANSAC keypoint match | original image. MATCH results are captioned in green, failures in red.
 
