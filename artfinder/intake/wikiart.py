@@ -34,7 +34,9 @@ def wikiart_image_first_generator(stream, labels: list, authority_set: set):
     """Transforms incoming Hugging Face dataset items on-the-fly."""
     for idx, item in enumerate(stream):
         raw_artist_name = resolve_artist_string(item, labels)
-        matched_canonical_name = scan_authority_manifest(raw_artist_name, authority_set)
-        
-        if matched_canonical_name is not None:
-            yield transform_to_standard_schema(idx, item, matched_canonical_name)
+        if not authority_set:
+            yield transform_to_standard_schema(idx, item, raw_artist_name)
+        else:
+            matched_canonical_name = scan_authority_manifest(raw_artist_name, authority_set)
+            if matched_canonical_name is not None:
+                yield transform_to_standard_schema(idx, item, matched_canonical_name)

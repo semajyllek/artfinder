@@ -1,4 +1,6 @@
+import json
 import logging
+import os
 import cv2
 import numpy as np
 import pandas as pd
@@ -11,6 +13,17 @@ logger = logging.getLogger(__name__)
 from .config import Config, create_orb_config
 from .vault.builder import load_source_metadata
 from .intake.wikiart import wikiart_image_first_generator
+
+_AUTHORITY_SET_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "artist_authority.json")
+
+
+def load_authority_set() -> set:
+    path = os.path.normpath(_AUTHORITY_SET_PATH)
+    if not os.path.exists(path):
+        logger.warning("Authority set not found at %s — ingesting all artists.", path)
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return set(json.load(f))
 
 BRAIN_PREFIX = "production_brain"
 BRAIN_EXTENSIONS = (".faiss", ".meta")
@@ -49,10 +62,10 @@ def _upload_image(state, image, visual_id):
 
 # ── Ingestion primitives ──────────────────────────────────────────────
 
-def _open_stream(authority_set):
+def _open_stream(authority_set=None):
     raw = load_dataset("huggan/wikiart", split="train", streaming=True)
     labels = raw.info.features["artist"].names
-    authority = authority_set if authority_set is not None else set()
+    authority = authority_set if authority_set is not None else load_authority_set()
     return wikiart_image_first_generator(raw, labels, authority)
 
 
