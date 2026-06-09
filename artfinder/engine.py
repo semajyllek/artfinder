@@ -3,6 +3,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
@@ -120,6 +121,8 @@ def _ingest_stream(state, stream, limit, skip_ids=frozenset()):
     producer = threading.Thread(target=_producer, daemon=True)
     producer.start()
 
+    t_start = time.time()
+    t_batch = time.time()
     count = 0
     batch = []
     while True:
@@ -132,22 +135,47 @@ def _ingest_stream(state, stream, limit, skip_ids=frozenset()):
             _flush_batch(state, batch)
             batch = []
             if count % 100 == 0:
-                logger.info("Ingested %d / %d artworks...", count, limit)
+                elapsed = time.time() - t_start
+                rate = count / elapsed if elapsed > 0 else 0
+                logger.info(
+                    "  [ingest] %d / %d  |  %.1f img/s  |  elapsed %.0fs",
+                    count, limit, rate, elapsed,
+                )
+                t_batch = time.time()
 
     if batch:
         _flush_batch(state, batch)
 
     producer.join()
+    elapsed = time.time() - t_start
+    logger.info(
+        "  [ingest] done — %d images in %.1fs  (%.1f img/s)",
+        count, elapsed, count / elapsed if elapsed > 0 else 0,
+    )
     return count
 
 
 def _finalize(state):
-    logger.info("Building Voronoi clusters natively in C++...")
+    t0 = time.time()
+    s = state.vault.stats()
+    logger.info(
+        "  [build] training IVF index — %d images, %d features, %d clusters...",
+        s["n_images"], s["n_features"], s["nlist"],
+    )
     state.vault.build()
+    logger.info("  [build] done in %.1fs", time.time() - t0)
+
+    t0 = time.time()
+    logger.info("  [save] writing vault to disk...")
     state.vault.save(BRAIN_PREFIX)
+    logger.info("  [save] done in %.1fs", time.time() - t0)
+
+    t0 = time.time()
+    logger.info("  [gcs] uploading metadata + vault...")
     state.source_df.to_parquet(Config.LOCAL_META, index=False)
     state.bucket.blob(Config.META_PATH).upload_from_filename(Config.LOCAL_META)
     _sync_brain_to_cloud(state)
+    logger.info("  [gcs] done in %.1fs", time.time() - t0)
 
 
 # ── Orchestrators ─────────────────────────────────────────────────────
