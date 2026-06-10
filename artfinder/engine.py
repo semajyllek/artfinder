@@ -67,10 +67,9 @@ def _upload_image(state, image, visual_id):
 # ── Ingestion primitives ──────────────────────────────────────────────
 
 def _open_stream(authority_set=None):
-    raw = load_dataset("huggan/wikiart", split="train", streaming=True)
-    labels = raw.info.features["artist"].names
+    raw = load_dataset("Artificio/WikiArt", split="train", streaming=True)
     authority = authority_set if authority_set is not None else load_authority_set()
-    return wikiart_image_first_generator(raw, labels, authority)
+    return wikiart_image_first_generator(raw, authority)
 
 
 def _to_grayscale(pil_image):
@@ -92,6 +91,9 @@ def _flush_batch(state, batch):
         'title':  item.get("title", ""),
         'artist': item.get("artist", ""),
         'url':    item.get("SourceURL", ""),
+        'genre':  item.get("genre", ""),
+        'style':  item.get("style", ""),
+        'date':   item.get("date", ""),
     } for item in batch])
     state.source_df = pd.concat([state.source_df, new_rows], ignore_index=True)
 
@@ -201,7 +203,7 @@ def run_complete_rebuild(state, limit=1000, authority_set=None, orb_config=None)
     _purge_images(state)
 
     state.vault = imret.Vault(orb_config or create_orb_config())
-    state.source_df = pd.DataFrame(columns=['id', 'title', 'artist', 'url'])
+    state.source_df = pd.DataFrame(columns=['id', 'title', 'artist', 'url', 'genre', 'style', 'date'])
 
     stream = _open_stream(authority_set)
     _ingest_stream(state, stream, limit)

@@ -1,13 +1,13 @@
 # artfinder
 
-artfinder is a visual art search system. It ingests paintings from the [WikiArt dataset](https://huggingface.co/datasets/huggan/wikiart) on HuggingFace, stores them on Google Cloud Storage, and identifies artworks from query images using the [imret](https://github.com/semajyllek/imret) image retrieval engine.
+artfinder is a visual art search system. It ingests paintings from the [WikiArt dataset](https://huggingface.co/datasets/Artificio/WikiArt) on HuggingFace, stores them on Google Cloud Storage, and identifies artworks from query images using the [imret](https://github.com/semajyllek/imret) image retrieval engine.
 
 ## How it works
 
 1. Images are streamed from the WikiArt HuggingFace dataset and filtered against an authority set of artist names.
 2. Grayscale frames are ingested in batches into an `imret.Vault` via `add_batch()`.
 3. After ingestion, `vault.build()` trains the FAISS IVF index.
-4. The vault and a source metadata parquet (id, title, artist, url) are saved locally and uploaded to GCS.
+4. The vault and a source metadata parquet (id, title, artist, url, genre, style, date) are saved locally and uploaded to GCS.
 5. At query time, the vault is loaded from GCS and searched with a query image. The matched label is resolved to a full metadata record.
 
 ## Requirements
@@ -181,7 +181,7 @@ result = engine.find_match(gray)
 print(result.artwork_id, result.title, result.artist, result.confidence)
 ```
 
-`find_match()` returns a `SearchResult` with fields: `artwork_id`, `title`, `artist`, `source_url`, `confidence`, `latency_ms`, `fallback_triggered`.
+`find_match()` returns a `SearchResult` with fields: `artwork_id`, `title`, `artist`, `source_url`, `confidence`, `latency_ms`, `fallback_triggered`, `genre`, `style`, `date`.
 
 ### Diagnostics
 

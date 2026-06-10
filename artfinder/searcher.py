@@ -13,6 +13,9 @@ class SearchResult:
     confidence: float
     latency_ms: float
     fallback_triggered: bool = False
+    genre: str = ""
+    style: str = ""
+    date: str = ""
 
 
 class ArtSearchEngine:
@@ -58,4 +61,7 @@ class ArtSearchEngine:
             confidence    = result.confidence,
             latency_ms    = latency_ms,
             fallback_triggered = result.fallback_used,
+            genre         = record.get('genre', ''),
+            style         = record.get('style', ''),
+            date          = record.get('date', ''),
         )

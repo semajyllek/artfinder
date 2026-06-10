@@ -8,4 +8,4 @@ def load_source_metadata(bucket):
     if blob.exists():
         content = blob.download_as_bytes()
         return pd.read_parquet(BytesIO(content))
-    return pd.DataFrame(columns=['id', 'title', 'artist', 'url'])
+    return pd.DataFrame(columns=['id', 'title', 'artist', 'url', 'genre', 'style', 'date'])
