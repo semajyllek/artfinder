@@ -45,13 +45,14 @@ def test_eval_config_field_names():
     """Catch accidental renames of EvalConfig fields."""
     import dataclasses
     fields = {f.name for f in dataclasses.fields(EvalConfig)}
-    assert fields == {"transform_fn", "orb_config", "visualize", "display", "results_dir"}
+    assert fields == {"transform_fn", "orb_config", "bucket", "visualize", "display", "results_dir"}
 
 
 def test_eval_config_defaults():
     fn = lambda g, rng: g
     cfg = object()
     ec = EvalConfig(transform_fn=fn, orb_config=cfg)
+    assert ec.bucket is None
     assert ec.visualize == 0
     assert ec.display is False
     assert ec.results_dir is None
@@ -208,6 +209,73 @@ def test_run_eval_loop_latencies_are_positive():
     r = _run_eval_loop(vault, sample, sample_map, ec)
     assert r["avg_ms"] > 0
     assert r["p95_ms"] >= r["avg_ms"] or np.isclose(r["p95_ms"], r["avg_ms"])
+
+
+def test_run_eval_loop_fail_downloads_returned_image(monkeypatch):
+    """When the vault returns a label outside the sample, the visualization
+    must show the *actual* returned image (downloaded from GCS), not fall
+    back to the query's own original image."""
+    import evaluate
+
+    vault, sample, sample_map = _make_sample_and_vault(n=3, all_correct=False)
+
+    downloaded = np.full((100, 100), 123, dtype=np.uint8)
+    download_calls = []
+
+    def fake_download_gray(bucket, visual_id):
+        download_calls.append(visual_id)
+        return downloaded
+
+    captured = []
+
+    def fake_save_visualization(query_gray, result_gray, original_gray, title,
+                                 out_path, orb_config, status, display=False):
+        captured.append(result_gray)
+
+    monkeypatch.setattr(evaluate, "_download_gray", fake_download_gray)
+    monkeypatch.setattr(evaluate, "_save_visualization", fake_save_visualization)
+
+    ec = evaluate.EvalConfig(
+        transform_fn=TRANSFORMS["none"],
+        orb_config=_no_op_orb_config(),
+        bucket=object(),
+        visualize=-1,
+    )
+    r = _run_eval_loop(vault, sample, sample_map, ec)
+
+    assert r["correct"] == 0
+    # "wrong" is not a key in sample_map, so it must be downloaded — once,
+    # then served from the in-loop cache for subsequent identical labels.
+    assert download_calls == ["wrong"]
+    assert all(np.array_equal(rg, downloaded) for rg in captured)
+
+
+def test_run_eval_loop_unknown_label_skips_download(monkeypatch):
+    """An 'Unknown' result has no image to fetch — must not hit GCS."""
+    import evaluate
+
+    rng = np.random.default_rng(0)
+    img = rng.integers(0, 256, (100, 100), dtype=np.uint8)
+    sample = [("img_0", img)]
+    sample_map = {"img_0": img}
+
+    class _UnknownVault:
+        def search(self, query):
+            return _MockResult("Unknown")
+
+    download_calls = []
+    monkeypatch.setattr(evaluate, "_download_gray",
+                         lambda bucket, vid: download_calls.append(vid))
+
+    ec = evaluate.EvalConfig(
+        transform_fn=TRANSFORMS["none"],
+        orb_config=_no_op_orb_config(),
+        bucket=object(),
+        visualize=-1,
+    )
+    _run_eval_loop(_UnknownVault(), sample, sample_map, ec)
+
+    assert download_calls == []
 
 
 def test_run_eval_loop_fallback_counting():

@@ -230,6 +230,7 @@ def _download_gray(bucket, visual_id: str) -> np.ndarray | None:
 class EvalConfig:
     transform_fn: Callable[[np.ndarray, np.random.Generator], np.ndarray]
     orb_config:   object                # imret.OrbConfig
+    bucket:       object        = None  # GCS bucket, to fetch "returned" images outside the sample
     visualize:    int          = 0      # number to visualize; -1 = all
     display:      bool         = False
     results_dir:  Optional[str] = None
@@ -242,6 +243,7 @@ def _run_eval_loop(vault, sample: list, sample_map: dict, eval_cfg: EvalConfig):
     correct   = 0
     fallbacks = 0
     latencies = []
+    download_cache = {}
 
     for i, (visual_id, original_gray) in enumerate(sample):
         query  = eval_cfg.transform_fn(original_gray, rng)
@@ -254,8 +256,19 @@ def _run_eval_loop(vault, sample: list, sample_map: dict, eval_cfg: EvalConfig):
         if result.fallback_used: fallbacks += 1
 
         if vis_count < vis_limit:
-            status      = "MATCH" if matched else "FAIL"
-            result_gray = original_gray if matched else sample_map.get(result.label, original_gray)
+            status = "MATCH" if matched else "FAIL"
+            if matched:
+                result_gray = original_gray
+            elif result.label in sample_map:
+                result_gray = sample_map[result.label]
+            elif result.label in download_cache:
+                result_gray = download_cache[result.label]
+            elif result.label != "Unknown" and eval_cfg.bucket is not None:
+                downloaded = _download_gray(eval_cfg.bucket, result.label)
+                result_gray = downloaded if downloaded is not None else original_gray
+                download_cache[result.label] = result_gray
+            else:
+                result_gray = original_gray
             title = (
                 f"[{i+1:03d}] {status}  |  "
                 f"{visual_id}  →  {result.label}  conf={result.confidence:.2%}"
@@ -355,6 +368,7 @@ def run_evaluation(
         eval_cfg = EvalConfig(
             transform_fn=fn,
             orb_config=orb_config,
+            bucket=state.bucket,
             visualize=visualize,
             display=display,
             results_dir=sub_dir,
